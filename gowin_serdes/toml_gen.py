@@ -24,6 +24,7 @@ from .config import (
     GearRate,
     GowinDevice,
     LaneConfig,
+    _is_138,
     device_num_quads,
 )
 
@@ -106,22 +107,31 @@ def _write_toml(config: Dict, path: str) -> None:
 
 
 def _default_quad_config(
-    quad_id: int, enabled: bool, has_extra_pads: bool, num_quads: int = 1
+    quad_id: int,
+    enabled: bool,
+    has_extra_pads: bool,
+    num_quads: int = 1,
+    device: GowinDevice = GowinDevice.GW5AT_15,
 ) -> Dict[str, Any]:
     """Quad-level TOML defaults.
 
-    Matches the Gowin IDE output for both single-quad (15K) and
+    Matches the Gowin IDE output for single-quad (15K) and
     multi-quad (138K) devices.
+
+    For GW5AST-138 the 125 MHz reference clock enters on Q1's REFPAD0
+    and is propagated to Q0 via inter-quad routing:
+    - Q0: ``ref_pad0_freq="0M"``, ``refimux0_sel=2``, ``ref_prop_dir=2``
+    - Q1: ``ref_pad0_freq="125M"``, ``ref_prop_dir=2``
     """
+    is_multi = num_quads > 1
+    is_gw5ast = device == GowinDevice.GW5AST_138
+
     cfg: Dict[str, Any] = {
         "enable": enabled,
-        "ref_pad0_freq": "125M",
         "cmu0_reset_by_fabric": False,
         "cmu1_reset_by_fabric": False,
         "quad_clk_to_mac_sel": "CM0",
         "mac_quad_clk_sel": "Q0",
-        "mclk_freq": "0M",
-        "gpio_freq": "0M",
         "pd_toggle_by_fabric": False,
         "lane_reset_by_fabric": True,
         "por_toggle_by_fabric": False,
@@ -137,10 +147,30 @@ def _default_quad_config(
         "qpll1_ref_sel": 0,
         "refmux_scheme": "USER_DEFINED",
     }
-    # Multi-quad devices (138K) include refmux routing fields
-    if num_quads > 1:
+
+    # Single-quad devices include mclk/gpio fields
+    if not is_multi:
+        cfg["mclk_freq"] = "0M"
+        cfg["gpio_freq"] = "0M"
+
+    if is_gw5ast:
+        # GW5AST-138 inter-quad clock routing: Q1 has the 125 MHz ref
+        # pad, Q0 receives it via refprop.
+        if quad_id == 0:
+            cfg["ref_pad0_freq"] = "0M"
+            cfg["refimux0_sel"] = 2
+        else:
+            cfg["ref_pad0_freq"] = "125M"
+        cfg["ref_prop_dir"] = 2
+        cfg["refomux0_sel"] = 0
+    elif is_multi:
+        # Generic multi-quad (GW5AT-138): default routing
+        cfg["ref_pad0_freq"] = "125M"
         cfg["ref_prop_dir"] = 1
         cfg["refomux0_sel"] = 0
+    else:
+        cfg["ref_pad0_freq"] = "125M"
+
     if has_extra_pads:
         cfg["ref_pad2_freq"] = "0M"
         cfg["ref_pad3_freq"] = "0M"
@@ -153,14 +183,16 @@ def _default_quad_config(
     return cfg
 
 
-def _default_lane_config(quad_id: int, lane_id: int) -> Dict[str, Any]:
+def _default_lane_config(
+    quad_id: int, lane_id: int, device: GowinDevice = GowinDevice.GW5AT_15
+) -> Dict[str, Any]:
     """Lane-level TOML defaults (disabled lane).
 
     Key ordering matches the Gowin IDE output so that a diff against
     the reference ``serdes_tmp.toml`` is clean.
     """
     qln = f"q{quad_id}.ln{lane_id}"
-    return {
+    cfg: Dict[str, Any] = {
         "cpll_reset_by_fabric": False,
         "chbond_align_pattern1": 124,
         "chbond_align_pattern1_is_kcode": False,
@@ -168,6 +200,8 @@ def _default_lane_config(quad_id: int, lane_id: int) -> Dict[str, Any]:
         "chbond_align_pattern2_is_kcode": False,
         "chbond_align_pattern3": 124,
         "chbond_align_pattern3_is_kcode": False,
+        "decode_mode": "OFF",
+        "encode_mode": "OFF",
         "preamEn": False,
         "rxBistInv": False,
         "rxPattern": "PRBS31",
@@ -192,10 +226,7 @@ def _default_lane_config(quad_id: int, lane_id: int) -> Dict[str, Any]:
         "pcs_rx_reset_by_fabric": True,
         "pcs_tx_reset_by_fabric": True,
         "pcs_tx_clk_src": 0,
-        "rx_seperated_width_mode": "10",
         "width_mode": 10,
-        "10GBASE-R": False,
-        "ilk_metaframe_len": "32",
         "dr_rx_att": 7,
         "dr_rx_att_boost": 0,
         "rx_bit_invert": False,
@@ -205,7 +236,6 @@ def _default_lane_config(quad_id: int, lane_id: int) -> Dict[str, Any]:
         "rx_byte_invert": False,
         "rx_coupling": "AC",
         "rx_data_manipulation_enable": False,
-        "decode_mode": "OFF",
         "eq_manual": False,
         "rx_gear_rate": "1:1",
         "rx_if_cfg_rd_start_depth": 8,
@@ -219,14 +249,12 @@ def _default_lane_config(quad_id: int, lane_id: int) -> Dict[str, Any]:
         "rx_slip_distance": 8,
         "idle_high_filter": 0,
         "idle_low_filter": 0,
-        "rxsd_use_dlogic": False,
         "chbond_trigger_by_fabric": True,
         "ctc_skipb_pattern_enable": False,
         "tx_bit_invert": False,
         "tx_byte_invert": False,
         "tx_data_manipulation_enable": False,
         "txlev": 15,
-        "encode_mode": "OFF",
         "ffe_c1": 0,
         "ffe_cm": 0,
         "ffe_manual": False,
@@ -245,6 +273,13 @@ def _default_lane_config(quad_id: int, lane_id: int) -> Dict[str, Any]:
         "ffe_c0": 40,
         "cpll_ref_sel": 0,
     }
+    # GW5AT-15 includes extra fields not present in the 138K reference
+    if not _is_138(device):
+        cfg["rx_seperated_width_mode"] = "10"
+        cfg["10GBASE-R"] = False
+        cfg["ilk_metaframe_len"] = "32"
+        cfg["rxsd_use_dlogic"] = False
+    return cfg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -279,6 +314,7 @@ def _build_enabled_lane(
     quad_id: int,
     lane_id: int,
     group: "GowinSerDesGroup",
+    device: GowinDevice = GowinDevice.GW5AT_15,
 ) -> Dict[str, Any]:
     """Build a complete TOML lane dict for an *enabled* lane.
 
@@ -290,14 +326,13 @@ def _build_enabled_lane(
     master_qln = f"q{quad_id}.ln{master_lane_id}"
     has_bonding = group.chbond_master is not None and group.num_lanes > 1
 
-    return {
+    cfg: Dict[str, Any] = {
         "tx_data_rate": lane_cfg.tx_data_rate,
         "rx_data_rate": lane_cfg.rx_data_rate,
         "pcs_tx_clk_src": _pcs_tx_clk_src(lane_cfg),
         "loopBack": "OFF",
         "enable": True,
         "width_mode": lane_cfg.width_mode,
-        "rx_seperated_width_mode": str(lane_cfg.width_mode),
         "tx_gear_rate": _GEAR_MAP[lane_cfg.tx_gear_rate],
         "rx_gear_rate": _GEAR_MAP[lane_cfg.rx_gear_rate],
         "cpll_reset_by_fabric": False,
@@ -307,6 +342,8 @@ def _build_enabled_lane(
         "chbond_align_pattern2_is_kcode": False,
         "chbond_align_pattern3": 124,
         "chbond_align_pattern3_is_kcode": False,
+        "decode_mode": _ENCODING_MAP[lane_cfg.rx_encoding],
+        "encode_mode": _ENCODING_MAP[lane_cfg.tx_encoding],
         "preamEn": False,
         "rxBistInv": False,
         "rxPattern": "PRBS31",
@@ -328,8 +365,6 @@ def _build_enabled_lane(
         "ctc_rd_start_depth": "8",
         "pcs_rx_reset_by_fabric": True,
         "pcs_tx_reset_by_fabric": True,
-        "10GBASE-R": False,
-        "ilk_metaframe_len": "32",
         "dr_rx_att": 7,
         "dr_rx_att_boost": 0,
         "rx_bit_invert": False,
@@ -339,7 +374,6 @@ def _build_enabled_lane(
         "rx_byte_invert": False,
         "rx_coupling": "AC",
         "rx_data_manipulation_enable": False,
-        "decode_mode": _ENCODING_MAP[lane_cfg.rx_encoding],
         "eq_manual": False,
         "rx_if_cfg_rd_start_depth": 8,
         "locked_from_fabric": False,
@@ -351,14 +385,12 @@ def _build_enabled_lane(
         "rx_slip_distance": 8,
         "idle_high_filter": 0,
         "idle_low_filter": 0,
-        "rxsd_use_dlogic": False,
         "chbond_trigger_by_fabric": True,
         "ctc_skipb_pattern_enable": False,
         "tx_bit_invert": False,
         "tx_byte_invert": False,
         "tx_data_manipulation_enable": False,
         "txlev": 15,
-        "encode_mode": _ENCODING_MAP[lane_cfg.tx_encoding],
         "ffe_c1": 0,
         "ffe_cm": 0,
         "ffe_manual": False,
@@ -375,6 +407,13 @@ def _build_enabled_lane(
         "ffe_c0": 40,
         "cpll_ref_sel": 0,
     }
+    # GW5AT-15 includes extra fields not present in the 138K reference
+    if not _is_138(device):
+        cfg["rx_seperated_width_mode"] = str(lane_cfg.width_mode)
+        cfg["10GBASE-R"] = False
+        cfg["ilk_metaframe_len"] = "32"
+        cfg["rxsd_use_dlogic"] = False
+    return cfg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -407,10 +446,14 @@ def build_toml_config(
     for qi in range(num_quads):
         qkey = f"q{qi}"
         enabled = qi in used_quads
-        qcfg = _default_quad_config(qi, enabled, has_extra_pads, num_quads)
+        qcfg = _default_quad_config(
+            qi, enabled, has_extra_pads, num_quads, device=device
+        )
 
         # If any lane in this quad is enabled, use its ref_clk_freq
-        if enabled:
+        # (but not for GW5AST-138 where clock routing is handled by
+        # _default_quad_config based on quad_id)
+        if enabled and device != GowinDevice.GW5AST_138:
             for g in groups:
                 if g.quad == qi and g.lane_configs:
                     qcfg["ref_pad0_freq"] = g.lane_configs[0].ref_clk_freq
@@ -438,9 +481,10 @@ def build_toml_config(
                     qi,
                     li,
                     lane_group,
+                    device=device,
                 )
             else:
-                lcfg_toml = _default_lane_config(qi, li)
+                lcfg_toml = _default_lane_config(qi, li, device=device)
 
             config[f"{qkey}.ln{li}"] = lcfg_toml
 

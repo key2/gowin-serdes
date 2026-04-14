@@ -19,6 +19,7 @@ from amaranth.lib.wiring import Component, In, Out
 
 from .config import (
     GowinDevice,
+    _is_138,
     device_num_quads,
     device_drp_num,
     device_is_quadb,
@@ -197,7 +198,7 @@ class GowinSerDes(Component):
         # ── INET signals (GW5AT-138) ──────────────────────────
         inet_q = {}
         inet_upar = {}
-        if self.device == GowinDevice.GW5AT_138:
+        if _is_138(self.device):
             for qi in range(self.num_quads):
                 inet_q[qi] = {
                     "INET_Q0_Q1": Signal(92, name=f"q{qi}_inet_q0_q1"),
@@ -225,6 +226,14 @@ class GowinSerDes(Component):
                         lane, abs_lane, is_quadb
                     )
 
+            # For multi-quad devices, only Q0 drives the global life_clk.
+            # Other quads' FABRIC_CM_LIFE_CLK_O goes to a dummy signal
+            # to avoid multiple-driver conflicts.
+            if qi == 0:
+                q_life_clk_out = life_clk
+            else:
+                q_life_clk_out = Signal(name=f"q{qi}_life_clk_out")
+
             quad_hw = GowinSerDesQuadInstance(
                 device=self.device,
                 quad_idx=qi,
@@ -234,6 +243,7 @@ class GowinSerDes(Component):
                 ahb_rstn=ahb_rstn,
                 test_dec_en=test_dec_en,
                 inet_signals=inet_q.get(qi, {}),
+                life_clk_out=q_life_clk_out,
             )
             m.submodules[f"quad{qi}"] = quad_hw
 

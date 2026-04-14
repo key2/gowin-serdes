@@ -259,7 +259,7 @@ UPAR_PORTS_138_ONLY = [
 
 def get_quad_ports(device_name: str):
     """Return the full list of (port_name, direction, width) for the QUAD primitive."""
-    from .config import GowinDevice
+    from .config import GowinDevice, _is_138
 
     device = GowinDevice(device_name) if isinstance(device_name, str) else device_name
 
@@ -279,7 +279,7 @@ def get_quad_ports(device_name: str):
         ports += list(QUAD_PORTS_QUADB_ONLY)
     elif device == GowinDevice.GW5AT_60:
         ports += list(QUAD_PORTS_QUADA_60_ONLY)
-    elif device == GowinDevice.GW5AT_138:
+    elif _is_138(device):
         ports += list(QUAD_PORTS_QUAD_ONLY)
 
     return ports
@@ -287,11 +287,11 @@ def get_quad_ports(device_name: str):
 
 def get_upar_ports(device_name: str):
     """Return the full list of (port_name, direction, width) for the UPAR primitive."""
-    from .config import GowinDevice
+    from .config import GowinDevice, _is_138
 
     device = GowinDevice(device_name) if isinstance(device_name, str) else device_name
 
     ports = list(UPAR_COMMON_PORTS)
-    if device == GowinDevice.GW5AT_138:
+    if _is_138(device):
         ports += list(UPAR_PORTS_138_ONLY)
     return ports

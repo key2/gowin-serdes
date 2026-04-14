@@ -13,7 +13,13 @@ from typing import Optional
 class GowinDevice(Enum):
     GW5AT_15 = "GW5AT-15"  # 1 quad, GTR12_QUADB, DRP_NUM=4
     GW5AT_60 = "GW5AT-60"  # 1 quad, GTR12_QUADA, DRP_NUM=4
-    GW5AT_138 = "GW5AT-138"  # 2 quads, GTR12_QUADA, DRP_NUM=8
+    GW5AT_138 = "GW5AT-138"  # 2 quads, GTR12_QUAD, DRP_NUM=8
+    GW5AST_138 = "GW5AST-138"  # 2 quads, GTR12_QUAD, DRP_NUM=8 (package variant)
+
+
+def _is_138(device: "GowinDevice") -> bool:
+    """True for any 138K variant (GW5AT-138 or GW5AST-138)."""
+    return device in (GowinDevice.GW5AT_138, GowinDevice.GW5AST_138)
 
 
 # Metadata per device for TOML / CSR generation:
@@ -22,6 +28,7 @@ DEVICE_META = {
     GowinDevice.GW5AT_15: ("GW5AT-15", "15k", 1, False),
     GowinDevice.GW5AT_60: ("GW5AT-60", "60k", 1, True),
     GowinDevice.GW5AT_138: ("GW5AT-138", "138k", 2, False),
+    GowinDevice.GW5AST_138: ("GW5AST-138", "138k", 2, False),
 }
 
 
@@ -142,22 +149,24 @@ class LaneConfig:
 
 
 def device_num_quads(device: GowinDevice) -> int:
-    return 2 if device == GowinDevice.GW5AT_138 else 1
+    return 2 if _is_138(device) else 1
 
 
 def device_drp_num(device: GowinDevice) -> int:
-    return 8 if device == GowinDevice.GW5AT_138 else 4
+    return 8 if _is_138(device) else 4
 
 
 def device_quad_primitive(device: GowinDevice) -> str:
-    """GW5AT-15 uses GTR12_QUADB. GW5AT-60 and GW5AT-138 use GTR12_QUADA."""
+    """GW5AT-15 uses GTR12_QUADB. GW5AT-60 uses GTR12_QUADA. 138K uses GTR12_QUAD."""
     if device == GowinDevice.GW5AT_15:
         return "GTR12_QUADB"
+    if _is_138(device):
+        return "GTR12_QUAD"
     return "GTR12_QUADA"
 
 
 def device_upar_primitive(device: GowinDevice) -> str:
-    if device == GowinDevice.GW5AT_138:
+    if _is_138(device):
         return "GTR12_UPAR"
     return "GTR12_UPARA"
 

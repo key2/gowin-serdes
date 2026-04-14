@@ -7,7 +7,7 @@ per device (not one per quad).
 
 from amaranth.hdl import Signal, Module, Instance, Const, Elaboratable
 
-from .config import GowinDevice, device_quad_primitive, device_upar_primitive
+from .config import GowinDevice, _is_138, device_quad_primitive, device_upar_primitive
 from .primitives import get_quad_ports, get_upar_ports
 
 
@@ -37,12 +37,14 @@ class GowinSerDesQuadInstance(Elaboratable):
         ahb_rstn,
         test_dec_en,
         inet_signals=None,
+        life_clk_out=None,
     ):
         self.device = device
         self.quad_idx = quad_idx
         self.lane_signals = lane_signals
         self.por_n = por_n
         self.life_clk = life_clk
+        self.life_clk_out = life_clk_out if life_clk_out is not None else life_clk
         self.ahb_rstn = ahb_rstn
         self.test_dec_en = test_dec_en
         self.inet_signals = inet_signals or {}
@@ -85,7 +87,7 @@ class GowinSerDesQuadInstance(Elaboratable):
                 _add_default_port(inst_args, port_name, direction, width)
 
         # POSITION defparam for multi-quad devices
-        if self.device == GowinDevice.GW5AT_138:
+        if _is_138(self.device):
             inst_args[f"p_POSITION"] = f"Q{self.quad_idx}"
 
         m.submodules.quad = Instance(quad_prim, **inst_args)
@@ -100,7 +102,9 @@ class GowinSerDesQuadInstance(Elaboratable):
             "CK_AHB_I": self.life_clk,
             "AHB_RSTN": self.ahb_rstn,
             "TEST_DEC_EN": self.test_dec_en,
-            "FABRIC_CM_LIFE_CLK_O": self.life_clk,
+            # life_clk_out may differ from life_clk for multi-quad devices
+            # where only Q0 drives the global life_clk signal.
+            "FABRIC_CM_LIFE_CLK_O": self.life_clk_out,
         }
         # ALL lane CPLL resets must be tied to por_n, not just active lanes.
         # Leaving unused CPLL in permanent reset can block the entire PLL tree.
