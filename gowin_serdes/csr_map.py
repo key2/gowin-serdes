@@ -736,3 +736,203 @@ def _to_int(v):
     if isinstance(v, str):
         return int(v)
     return int(v)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PIPE adapter interface — CSR enum, address helper, constants, and tables
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class CSR(IntEnum):
+    """Logical CSR register selector used by the PIPE adapter layer.
+
+    Each member maps to a ``LaneCSR`` property via :func:`csr_addr`.
+    """
+
+    EIDLE = 0  # Electrical-idle control
+    RXDET_PULSE = 1  # Receiver-detection pulse trigger
+    RXDET_RESULT = 2  # Receiver-detection result readback
+    RX_POLARITY = 3  # PCS RX polarity inversion
+    PCS_8B10B = 4  # PCS 8b10b encode/decode bypass
+    TX_FFE_C0 = 5  # TX FFE coefficient 0
+    TX_FFE_C1 = 6  # TX FFE coefficient 1
+    TX_FFE_VDDT = 7  # TX FFE voltage / driver trim
+
+
+def csr_addr(csr: CSR, quad: int = 0, lane: int = 0) -> int:
+    """Compute the 24-bit DRP address for a logical CSR register.
+
+    Parameters
+    ----------
+    csr : CSR
+        Logical register selector.
+    quad : int
+        Quad index (0 or 1).
+    lane : int
+        Lane index within quad (0-3).
+
+    Returns
+    -------
+    int
+        24-bit DRP address suitable for ``Signal(24)``.
+    """
+    q = Quad.Q0 if quad == 0 else Quad.Q1
+    lc = LaneCSR(quad=q, lane=lane)
+
+    _map = {
+        CSR.EIDLE: lc.eidle_addr,
+        CSR.RXDET_PULSE: lc.pulse_addr,
+        CSR.RXDET_RESULT: lc.rxdet_addr,
+        CSR.RX_POLARITY: lc.rx_polarity_addr,
+        CSR.PCS_8B10B: lc.pcs_8b10b_addr,
+        CSR.TX_FFE_C0: lc.tx_ffe_0,
+        CSR.TX_FFE_C1: lc.tx_ffe_1,
+        CSR.TX_FFE_VDDT: lc.tx_ffe_2,
+    }
+    return _map[csr]
+
+
+# ── DRP write-data constants ──────────────────────────────────────────────
+
+EIDLE_ON = 0x00000001  # Assert electrical idle
+EIDLE_OFF = 0x00000007  # Deassert electrical idle
+
+RXDET_START = 0x03000000  # Start receiver-detection pulse
+RXDET_END = 0x00000000  # End receiver-detection pulse
+
+RX_POLARITY_NORMAL = 0x00000000  # RX polarity normal
+RX_POLARITY_INVERT = 0x00000001  # RX polarity inverted
+
+BYPASS_8B10B = 0x00000001  # Bypass 8b10b encode/decode
+
+
+# ── Table generators ──────────────────────────────────────────────────────
+
+
+def lfps_ffe_regs(quad: int = 0, lane: int = 0) -> list:
+    """Return FFE register (addr, normal_val, lfps_val, desc) tuples.
+
+    During LFPS signaling the TX driver must be reconfigured to produce
+    low-frequency square-wave signaling.  These three registers hold the
+    normal (high-speed) and LFPS (low-swing) FFE settings.
+
+    Parameters
+    ----------
+    quad, lane : int
+        Quad and lane indices.
+
+    Returns
+    -------
+    list[tuple[int, int, int, str]]
+        ``[(address, normal_value, lfps_value, description), ...]``
+    """
+    q = Quad.Q0 if quad == 0 else Quad.Q1
+    lc = LaneCSR(quad=q, lane=lane)
+    return [
+        (lc.tx_ffe_0, 0x0000F000, 0x00000040, "TX FFE_0"),
+        (lc.tx_ffe_1, 0x00000000, 0x00000001, "TX FFE_1"),
+        (lc.tx_ffe_2, 0x00000110, 0x00000003, "TX FFE_2"),
+    ]
+
+
+def rate_change_regs(quad: int = 0, lane: int = 0) -> list:
+    """Return rate-change register (addr, gen1_val, gen2_val, desc) tuples.
+
+    These registers must be rewritten atomically (under DRP lock) when
+    switching between Gen1 (2.5 Gbps) and Gen2 (5.0 Gbps) line rates.
+
+    Parameters
+    ----------
+    quad, lane : int
+        Quad and lane indices.
+
+    Returns
+    -------
+    list[tuple[int, int, int, str]]
+        ``[(address, gen1_value, gen2_value, description), ...]``
+    """
+    q = Quad.Q0 if quad == 0 else Quad.Q1
+    lc = LaneCSR(quad=q, lane=lane)
+
+    # CPLL divider is in a per-lane register at quad<<16 | (0xA020 + lane*0x200)
+    cpll_addr = (int(q) << 16) | (0xA020 + lane * 0x200)
+    # TX/RX clock source at PCS base offsets
+    tx_clk_addr = lc.pcs_base | 0x600  # Approximate — TX clock source
+    rx_clk_addr = lc.pcs_base | 0x620  # Approximate — RX clock source
+    pcs_rate_addr = lc.pcs_base  # PCS rate mode
+
+    return [
+        (cpll_addr, 0x0000001A, 0x00000014, "CPLL divider ratio"),
+        (lc.afe_base | 0xA0, 0x00003150, 0x00001170, "RX AFE gain/attenuation"),
+        (lc.afe_base | 0xB8, 0x00000020, 0x00000040, "RX AFE bias current"),
+        (lc.afe_base | 0xC0, 0x00000210, 0x00000310, "RX AFE boost"),
+        (tx_clk_addr, 0x0000011A, 0x0000021A, "TX clock source select"),
+        (rx_clk_addr, 0x00000016, 0x00000026, "RX clock source select"),
+        (pcs_rate_addr, 0x00000001, 0x00000003, "PCS rate mode"),
+    ]
+
+
+def csr_init_table(quad: int = 0, lane: int = 0) -> list:
+    """Return the power-on CSR initialization sequence.
+
+    These 11 DRP writes configure the TX driver (FFE), CDR loop filter,
+    and lane control registers.  They must be performed in order before
+    any PIPE operations.
+
+    Parameters
+    ----------
+    quad, lane : int
+        Quad and lane indices.
+
+    Returns
+    -------
+    list[tuple[str, int, int]]
+        ``[(name, address, data), ...]``
+    """
+    q = Quad.Q0 if quad == 0 else Quad.Q1
+    lc = LaneCSR(quad=q, lane=lane)
+    return [
+        ("TX_FFE_0", lc.tx_ffe_0, 0x0000F000),
+        ("TX_FFE_1", lc.tx_ffe_1, 0x00000000),
+        ("TX_FFE_2", lc.tx_ffe_2, 0x00000110),
+        ("CDR_CFG_shared", lc.cdr_cfg_shared, 0x00038002),
+        ("LN_CTRL_shared", lc.ln_ctrl_shared, 0xFFFFF9FF),
+        ("CDR_CFG_0", lc.cdr_cfg_0, 0x7F000000),
+        ("CDR_CFG_1", lc.cdr_cfg_1, 0x007F0000),
+        ("CDR_CFG_2", lc.cdr_cfg_2, 0x7F000000),
+        ("CDR_CFG_3", lc.cdr_cfg_3, 0x0000004F),
+        ("CDR_CFG_4", lc.cdr_cfg_4, 0x0000004F),
+        ("CDR_CFG_5", lc.cdr_cfg_5, 0x00004F00),
+    ]
+
+
+def runtime_addrs(quad: int = 0, lane: int = 0) -> dict:
+    """Return a dict of register-name → 24-bit DRP address.
+
+    Provides a convenient lookup for all CSR addresses relevant at
+    runtime (after init).
+
+    Parameters
+    ----------
+    quad, lane : int
+        Quad and lane indices.
+
+    Returns
+    -------
+    dict[str, int]
+    """
+    q = Quad.Q0 if quad == 0 else Quad.Q1
+    lc = LaneCSR(quad=q, lane=lane)
+    return {
+        "eidle": lc.eidle_addr,
+        "rxdet_pulse": lc.pulse_addr,
+        "rxdet_result": lc.rxdet_addr,
+        "rx_polarity": lc.rx_polarity_addr,
+        "pcs_8b10b": lc.pcs_8b10b_addr,
+        "tx_ffe_0": lc.tx_ffe_0,
+        "tx_ffe_1": lc.tx_ffe_1,
+        "tx_ffe_2": lc.tx_ffe_2,
+        "cdr_cfg_shared": lc.cdr_cfg_shared,
+        "ln_ctrl_shared": lc.ln_ctrl_shared,
+        "loopback": lc.loopback_addr,
+    }
