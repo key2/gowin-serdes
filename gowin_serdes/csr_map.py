@@ -852,14 +852,16 @@ def rate_change_regs(quad: int = 0, lane: int = 0) -> list:
         ``[(address, gen1_value, gen2_value, description), ...]``
     """
     q = Quad.Q0 if quad == 0 else Quad.Q1
+    qi = int(q)
     lc = LaneCSR(quad=q, lane=lane)
 
-    # CPLL divider is in a per-lane register at quad<<16 | (0xA020 + lane*0x200)
-    cpll_addr = (int(q) << 16) | (0xA020 + lane * 0x200)
-    # TX/RX clock source at PCS base offsets
-    tx_clk_addr = lc.pcs_base | 0x600  # Approximate — TX clock source
-    rx_clk_addr = lc.pcs_base | 0x620  # Approximate — RX clock source
-    pcs_rate_addr = lc.pcs_base  # PCS rate mode
+    # CPLL divider: CPLL block, stride=0x200 per lane
+    cpll_addr = (qi << 16) | (0xA020 + lane * 0x200)
+    # Clock mux: quad-ctrl space, stride=0x8 per lane
+    tx_clk_addr = (qi << 16) | (0x8600 + lane * 0x8)
+    rx_clk_addr = (qi << 16) | (0x8620 + lane * 0x8)
+    # PCS rate mode: PCS base + 0x00
+    pcs_rate_addr = lc.pcs_base
 
     return [
         (cpll_addr, 0x0000001A, 0x00000014, "CPLL divider ratio"),
