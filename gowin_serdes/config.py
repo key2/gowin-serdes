@@ -106,6 +106,47 @@ class LaneConfig:
     ctc_enable: bool = False
     cc_clk_source: Optional[str] = None
 
+    # ── TX FFE / driver configuration ────────────────────────
+    # When any of ffe_cm, ffe_c0, ffe_c1 is not None, ffe_manual
+    # is forced True in the TOML and the coefficients are written
+    # to CSR address 0x808238 (for quad 0, lane 0).
+    #
+    # Constraint: cm + c0 + c1 = 40, with c0 >= 20.
+    # The Gowin SerDes stores cm in [4:0] and c1 in [12:8] of
+    # register 0x808238.  c0 is implicit (40 - cm - c1).
+    #
+    # txlev controls the TX output level (0–15) at CSR 0x808234[15:12].
+    # vddt sets the differential swing voltage (180–900 mV, step 48 mV)
+    # but is NOT mapped to any CSR register by the Gowin tool — it
+    # only affects the TOML metadata.
+    txlev: Optional[int] = None  # 0–15 (default 15 in TOML)
+    vddt: Optional[float] = None  # 180.0–900.0 mV (step 48)
+    ffe_cm: Optional[int] = None  # Pre-cursor: 0–19
+    ffe_c0: Optional[int] = None  # Main cursor: 20–40
+    ffe_c1: Optional[int] = None  # Post-cursor: 0–19
+
+    @property
+    def ffe_manual(self) -> bool:
+        """True when any FFE coefficient is explicitly set."""
+        return any(v is not None for v in (self.ffe_cm, self.ffe_c0, self.ffe_c1))
+
+    def ffe_effective(self) -> tuple:
+        """Return (cm, c0, c1) with defaults filled in.
+
+        Ensures cm + c0 + c1 = 40 and c0 >= 20.
+        """
+        cm = self.ffe_cm if self.ffe_cm is not None else 0
+        c1 = self.ffe_c1 if self.ffe_c1 is not None else 0
+        c0 = self.ffe_c0 if self.ffe_c0 is not None else (40 - cm - c1)
+
+        assert cm + c0 + c1 == 40, (
+            f"FFE coefficients must sum to 40: cm={cm} + c0={c0} + c1={c1} = {cm + c0 + c1}"
+        )
+        assert c0 >= 20, f"FFE c0 must be >= 20, got {c0}"
+        assert 0 <= cm <= 19, f"FFE cm must be 0–19, got {cm}"
+        assert 0 <= c1 <= 19, f"FFE c1 must be 0–19, got {c1}"
+        return cm, c0, c1
+
     @property
     def has_tx(self) -> bool:
         return self.operation_mode != OperationMode.RX_ONLY
