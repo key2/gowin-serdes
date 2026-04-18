@@ -200,32 +200,10 @@ class GowinSerDesLane(Component):
                 self.status.rx_dscr_err.eq(self._quad_rxdata[74]),
             ]
 
-        # ── RX wiring ──────────────────────────────────────────
-        if cfg.has_rx:
-            m.d.comb += [
-                self.rx.data.eq(self._quad_rxdata),
-                self.rx.valid.eq(self._quad_rx_vld),
-                self.rx.pcs_clkout.eq(self._quad_rx_pcs_clk),
-                self._quad_rx_clk.eq(self.rx.clk),
-                self._quad_fifo_rden.eq(self.rx.fifo_rden),
-                self.rx.fifo_rdusewd.eq(self._quad_rx_fifo_rdusewd),
-                self.rx.fifo_aempty.eq(self._quad_rx_fifo_aempty),
-                self.rx.fifo_empty.eq(self._quad_rx_fifo_empty),
-            ]
-
-        # ── Status wiring ──────────────────────────────────────
-        m.d.comb += [
-            self.status.ready.eq(self._quad_stat[12]),
-            self.status.signal_detect.eq(self._quad_astat[5]),
-            self.status.rx_cdr_lock.eq(self._quad_pma_rx_lock),
-            self.status.pll_lock.eq(self._quad_cmu_ok),
-            self.status.refclk.eq(self._quad_cmu_ck_ref),
-        ]
-        if cfg.has_8b10b:
-            m.d.comb += [
-                self.status.k_lock.eq(self._quad_k_lock),
-                self.status.word_align_link.eq(self._quad_align_link),
-            ]
+        # NOTE: Duplicate RX and Status wiring blocks that existed here
+        # (lines 203-228 in the original) have been removed. The first
+        # wiring blocks above (with has_64b66b/has_64b67b dispatch for
+        # RX, and has_8b10b/has_64b for Status) are the canonical ones.
 
         # ── Reset wiring ───────────────────────────────────────
         m.d.comb += [
