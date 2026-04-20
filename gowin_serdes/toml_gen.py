@@ -24,6 +24,8 @@ from .config import (
     GearRate,
     GowinDevice,
     LaneConfig,
+    PLLSelection,
+    RefClkSource,
     _is_138,
     device_num_quads,
 )
@@ -118,13 +120,13 @@ def _default_quad_config(
     Matches the Gowin IDE output for single-quad (15K) and
     multi-quad (138K) devices.
 
-    For GW5AST-138 the 125 MHz reference clock enters on Q1's REFPAD0
-    and is propagated to Q0 via inter-quad routing:
-    - Q0: ``ref_pad0_freq="0M"``, ``refimux0_sel=2``, ``ref_prop_dir=2``
-    - Q1: ``ref_pad0_freq="125M"``, ``ref_prop_dir=2``
+    For multi-quad devices, reference clock routing fields
+    (``ref_pad0/1_freq``, ``refimux0_sel``, ``refomux0_sel``,
+    ``ref_prop_dir``) are set to safe defaults here.  The actual
+    routing is computed by ``_compute_refclk_routing()`` and applied
+    as overrides in ``build_toml_config()``.
     """
     is_multi = num_quads > 1
-    is_gw5ast = device == GowinDevice.GW5AST_138
 
     cfg: Dict[str, Any] = {
         "enable": enabled,
@@ -135,6 +137,7 @@ def _default_quad_config(
         "pd_toggle_by_fabric": False,
         "lane_reset_by_fabric": True,
         "por_toggle_by_fabric": False,
+        "ref_pad0_freq": "0M",
         "ref_pad1_freq": "0M",
         "rx_eq_bias": 7,
         "rx_quad_clk_internal_sel": "LN0_PMA_RX_CLK",
@@ -152,24 +155,11 @@ def _default_quad_config(
     if not is_multi:
         cfg["mclk_freq"] = "0M"
         cfg["gpio_freq"] = "0M"
-
-    if is_gw5ast:
-        # GW5AST-138 inter-quad clock routing: Q1 has the 125 MHz ref
-        # pad, Q0 receives it via refprop.
-        if quad_id == 0:
-            cfg["ref_pad0_freq"] = "0M"
-            cfg["refimux0_sel"] = 2
-        else:
-            cfg["ref_pad0_freq"] = "125M"
-        cfg["ref_prop_dir"] = 2
-        cfg["refomux0_sel"] = 0
-    elif is_multi:
-        # Generic multi-quad (GW5AT-138): default routing
         cfg["ref_pad0_freq"] = "125M"
+    else:
+        # Multi-quad: routing defaults (overridden by _compute_refclk_routing)
         cfg["ref_prop_dir"] = 1
         cfg["refomux0_sel"] = 0
-    else:
-        cfg["ref_pad0_freq"] = "125M"
 
     if has_extra_pads:
         cfg["ref_pad2_freq"] = "0M"
@@ -301,12 +291,17 @@ _GEAR_MAP = {
 
 
 def _pcs_tx_clk_src(lane_cfg: LaneConfig) -> int:
-    """Derive pcs_tx_clk_src from the TX data rate.
+    """Derive pcs_tx_clk_src from the PLL selection.
 
-    0 = internal (≤1.5 Gbps), 1 = from PLL (>1.5 Gbps).
+    0 = CPLL  (Channel PLL / per-lane PLL)
+    1 = QPLL0 (Quad PLL 0 / shared CMU0)
+    2 = QPLL1 (Quad PLL 1 / shared CMU1)
     """
-    rate_ghz = float(lane_cfg.tx_data_rate.rstrip("G"))
-    return 1 if rate_ghz > 1.5 else 0
+    if lane_cfg.pll == PLLSelection.QPLL0:
+        return 1
+    if lane_cfg.pll == PLLSelection.QPLL1:
+        return 2
+    return 0  # CPLL
 
 
 def _build_enabled_lane(
@@ -327,84 +322,84 @@ def _build_enabled_lane(
     has_bonding = group.chbond_master is not None and group.num_lanes > 1
 
     cfg: Dict[str, Any] = {
+        "chbond_trigger_by_fabric": True,
+        "enable": True,
         "tx_data_rate": lane_cfg.tx_data_rate,
+        "tx_ovs_mode": "OFF",
+        "tx_ovs_ratio": "N/A",
         "rx_data_rate": lane_cfg.rx_data_rate,
         "pcs_tx_clk_src": _pcs_tx_clk_src(lane_cfg),
         "loopBack": "OFF",
-        "enable": True,
         "width_mode": lane_cfg.width_mode,
+        "encode_mode": _ENCODING_MAP[lane_cfg.tx_encoding],
+        "decode_mode": _ENCODING_MAP[lane_cfg.rx_encoding],
         "tx_gear_rate": _GEAR_MAP[lane_cfg.tx_gear_rate],
         "rx_gear_rate": _GEAR_MAP[lane_cfg.rx_gear_rate],
-        "cpll_reset_by_fabric": False,
+        "word_align_enable": lane_cfg.word_align,
+        "comma": "K28.5",
+        "comma_mask": "1111111111",
+        "tx_pol_invert": False,
+        "tx_data_manipulation_enable": False,
+        "rx_pol_invert": False,
+        "rx_data_manipulation_enable": False,
+        "chbond_enable": has_bonding,
+        "chbond_align_length": group.num_lanes if has_bonding else 1,
+        "chbond_align_pattern0": 124,
         "chbond_align_pattern1": 124,
-        "chbond_align_pattern1_is_kcode": False,
         "chbond_align_pattern2": 124,
-        "chbond_align_pattern2_is_kcode": False,
         "chbond_align_pattern3": 124,
+        "chbond_align_pattern1_is_kcode": False,
+        "chbond_align_pattern2_is_kcode": False,
         "chbond_align_pattern3_is_kcode": False,
-        "decode_mode": _ENCODING_MAP[lane_cfg.rx_encoding],
-        "encode_mode": _ENCODING_MAP[lane_cfg.tx_encoding],
+        "chbond_max_skew": 8,
+        "chbond_cfg_rd_start_depth": 16,
+        "chbond_clk_src": "lane",
+        "ctc_enable": lane_cfg.ctc_enable,
+        "ctc_skipb_pattern_enable": False,
+        "ctc_clk_src": "fabric_c2i_clk",
+        "ctc_skipa_pattern": 124,
+        "ctc_skipb_pattern": 124,
+        "ctc_skipb_pattern_is_kcode": False,
+        "ctc_rd_start_depth": "16",
+        "txlev": lane_cfg.txlev if lane_cfg.txlev is not None else 15,
+        "ffe_manual": lane_cfg.ffe_manual,
+        "ffe_cm": lane_cfg.ffe_effective()[0] if lane_cfg.ffe_manual else 0,
+        "ffe_c1": lane_cfg.ffe_effective()[2] if lane_cfg.ffe_manual else 0,
+        "ffe_c0": lane_cfg.ffe_effective()[1] if lane_cfg.ffe_manual else 40,
+        "sr_sd_thsel": 3,
+        "eq_manual": False,
+        "dr_rx_att": 7,
+        "dr_rx_boost": 9,
+        "cdr_calib_clk_src": "AUTO",
+        "cpll_reset_by_fabric": False,
         "preamEn": False,
         "rxBistInv": False,
         "rxPattern": "PRBS31",
         "txBistInv": False,
         "txPattern": "PRBS31",
         "cdr_gc_counter": 250,
-        "cdr_calib_clk_src": "AUTO",
-        "chbond_enable": has_bonding,
-        "chbond_align_length": group.num_lanes if has_bonding else 1,
-        "chbond_align_pattern0": 124,
         "chbond_mst_sel": master_qln if has_bonding else qln,
-        "chbond_max_skew": 8,
-        "ctc_enable": lane_cfg.ctc_enable,
-        "ctc_skipb_pattern": 28,
-        "ctc_skipb_pattern_is_kcode": False,
-        "ctc_clk_src": "fabric_c2i_clk",
         "ctc_mst_sel": qln,
-        "ctc_skipa_pattern": 28,
-        "ctc_rd_start_depth": "8",
         "pcs_rx_reset_by_fabric": True,
         "pcs_tx_reset_by_fabric": True,
-        "dr_rx_att": 7,
         "dr_rx_att_boost": 0,
         "rx_bit_invert": False,
-        "chbond_clk_src": "lane",
-        "chbond_cfg_rd_start_depth": 8,
-        "dr_rx_boost": 9,
         "rx_byte_invert": False,
         "rx_coupling": "AC",
-        "rx_data_manipulation_enable": False,
-        "eq_manual": False,
         "rx_if_cfg_rd_start_depth": 8,
         "locked_from_fabric": False,
         "rx_ovs_mode": "OFF",
         "rx_ovs_pll_src": "N/A",
         "rx_ovs_ratio": "N/A",
-        "rx_pol_invert": False,
-        "sr_sd_thsel": 3,
         "rx_slip_distance": 8,
         "idle_high_filter": 0,
         "idle_low_filter": 0,
-        "chbond_trigger_by_fabric": True,
-        "ctc_skipb_pattern_enable": False,
         "tx_bit_invert": False,
         "tx_byte_invert": False,
-        "tx_data_manipulation_enable": False,
-        "txlev": lane_cfg.txlev if lane_cfg.txlev is not None else 15,
-        "ffe_c1": lane_cfg.ffe_effective()[2] if lane_cfg.ffe_manual else 0,
-        "ffe_cm": lane_cfg.ffe_effective()[0] if lane_cfg.ffe_manual else 0,
-        "ffe_manual": lane_cfg.ffe_manual,
         "tx_if_cfg_mst_sel": master_qln if has_bonding else qln,
         "tx_if_cfg_rd_start_depth": 8,
-        "tx_ovs_mode": "OFF",
-        "tx_ovs_ratio": "N/A",
-        "tx_pol_invert": False,
         "tx_slip_distance": 8,
         "vddt": lane_cfg.vddt if lane_cfg.vddt is not None else 900.0,
-        "word_align_enable": lane_cfg.word_align,
-        "comma": "K28.5",
-        "comma_mask": "1111111111",
-        "ffe_c0": lane_cfg.ffe_effective()[1] if lane_cfg.ffe_manual else 40,
         "cpll_ref_sel": 0,
     }
     # GW5AT-15 includes extra fields not present in the 138K reference
@@ -414,6 +409,123 @@ def _build_enabled_lane(
         cfg["ilk_metaframe_len"] = "32"
         cfg["rxsd_use_dlogic"] = False
     return cfg
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REFERENCE CLOCK ROUTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _compute_refclk_routing(
+    groups: List["GowinSerDesGroup"],
+    num_quads: int,
+) -> Dict[int, Dict[str, Any]]:
+    """Compute per-quad reference clock routing for multi-quad devices.
+
+    Analyses the ``ref_clk_source`` and ``pll`` attributes of all active
+    lanes and returns a dict mapping ``quad_id`` to a dict of routing
+    overrides (``ref_pad0_freq``, ``ref_pad1_freq``, ``refimux0_sel``,
+    ``refomux0_sel``, ``ref_prop_dir``).
+
+    Routing rules (derived from Gowin IDE reference output for
+    GW5AST-138):
+
+    ===  ``refimux0_sel`` values  ===
+      0 – local pad 0
+      1 – forwarded from Q0 (used on Q1)
+      2 – forwarded from Q1 (used on Q0)
+      3 – local pad 1
+
+    ===  ``refomux0_sel`` values  ===
+      0 – forward pad 0 to neighbour (or none)
+      1 – forward pad 1 to neighbour
+
+    ===  ``ref_prop_dir``  ===
+      1 – Q0 → Q1
+      2 – Q1 → Q0
+    """
+    routing: Dict[int, Dict[str, Any]] = {}
+    for qi in range(num_quads):
+        routing[qi] = {
+            "ref_pad0_freq": "0M",
+            "ref_pad1_freq": "0M",
+            "refimux0_sel": 0,
+            "refomux0_sel": 0,
+            "ref_prop_dir": 1,
+        }
+
+    if not groups:
+        return routing
+
+    # Determine the primary reference clock source from the first active
+    # lane.  All lanes should share the same ref_clk_source; if not, the
+    # first one determines the pad/routing topology.
+    first_lc = groups[0].lane_configs[0]
+    ref_src: RefClkSource = first_lc.ref_clk_source
+    ref_freq: str = first_lc.ref_clk_freq
+
+    # Which quads have enabled lanes?
+    active_quads = {g.quad for g in groups}
+
+    # Check whether Q0 has any QPLL lanes (affects a routing special case).
+    q0_uses_qpll = any(
+        lc.pll in (PLLSelection.QPLL0, PLLSelection.QPLL1)
+        for g in groups
+        if g.quad == 0
+        for lc in g.lane_configs
+    )
+
+    if ref_src == RefClkSource.Q0_REFCLK0:
+        # 125 MHz on Q0 pad 0
+        routing[0]["ref_pad0_freq"] = ref_freq
+        routing[0]["refimux0_sel"] = 0  # Q0 uses local pad 0
+        if 1 in active_quads and num_quads > 1:
+            routing[1]["refimux0_sel"] = 1  # Q1 receives from Q0
+        # prop_dir = 1 (Q0 → Q1)
+        for qi in range(num_quads):
+            routing[qi]["ref_prop_dir"] = 1
+
+    elif ref_src == RefClkSource.Q0_REFCLK1:
+        # 125 MHz on Q0 pad 1
+        routing[0]["ref_pad1_freq"] = ref_freq
+        routing[0]["refimux0_sel"] = 3  # Q0 uses local pad 1
+        if 1 in active_quads and num_quads > 1:
+            routing[1]["refimux0_sel"] = 1  # Q1 receives from Q0
+            routing[0]["refomux0_sel"] = 1  # Q0 forwards pad 1
+        for qi in range(num_quads):
+            routing[qi]["ref_prop_dir"] = 1
+
+    elif ref_src == RefClkSource.Q1_REFCLK0:
+        # Special case: when only Q0 lanes are active and all use CPLL,
+        # the Gowin IDE maps Q1_REFCLK0 to Q0's pad 1 instead of using
+        # cross-quad routing (CPLL needs a local reference path).
+        if 0 in active_quads and not q0_uses_qpll and 1 not in active_quads:
+            routing[0]["ref_pad1_freq"] = ref_freq
+            routing[0]["refimux0_sel"] = 3  # Q0 uses local pad 1
+            for qi in range(num_quads):
+                routing[qi]["ref_prop_dir"] = 1
+        else:
+            # Normal cross-quad: 125 MHz on Q1 pad 0, propagated to Q0
+            routing[1]["ref_pad0_freq"] = ref_freq
+            if 1 in active_quads:
+                routing[1]["refimux0_sel"] = 0  # Q1 uses local pad 0
+            if 0 in active_quads:
+                routing[0]["refimux0_sel"] = 2  # Q0 receives from Q1
+            for qi in range(num_quads):
+                routing[qi]["ref_prop_dir"] = 2
+
+    elif ref_src == RefClkSource.Q1_REFCLK1:
+        # 125 MHz on Q1 pad 1
+        routing[1]["ref_pad1_freq"] = ref_freq
+        routing[1]["refomux0_sel"] = 1  # Q1 forwards pad 1
+        if 1 in active_quads:
+            routing[1]["refimux0_sel"] = 3  # Q1 uses local pad 1
+        if 0 in active_quads:
+            routing[0]["refimux0_sel"] = 2  # Q0 receives from Q1
+        for qi in range(num_quads):
+            routing[qi]["ref_prop_dir"] = 2
+
+    return routing
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -434,8 +546,13 @@ def build_toml_config(
     meta = DEVICE_META[device]
     toml_device_name, _, num_quads, has_extra_pads = meta
 
+    is_multi = num_quads > 1
+
     # Determine which quads are in use
     used_quads = {g.quad for g in groups}
+
+    # Compute reference clock routing for multi-quad devices
+    refclk_routing = _compute_refclk_routing(groups, num_quads) if is_multi else None
 
     config: Dict[str, Any] = {
         "device": toml_device_name,
@@ -450,13 +567,20 @@ def build_toml_config(
             qi, enabled, has_extra_pads, num_quads, device=device
         )
 
-        # If any lane in this quad is enabled, use its ref_clk_freq
-        # (but not for GW5AST-138 where clock routing is handled by
-        # _default_quad_config based on quad_id)
-        if enabled and device != GowinDevice.GW5AST_138:
+        if is_multi and refclk_routing:
+            # Apply computed routing overrides for multi-quad devices
+            qcfg.update(refclk_routing[qi])
+        elif not is_multi and enabled:
+            # Single-quad: use the first lane's ref_clk_freq on the
+            # appropriate pad based on ref_clk_source.
             for g in groups:
                 if g.quad == qi and g.lane_configs:
-                    qcfg["ref_pad0_freq"] = g.lane_configs[0].ref_clk_freq
+                    lc = g.lane_configs[0]
+                    if lc.ref_clk_source == RefClkSource.Q0_REFCLK1:
+                        qcfg["ref_pad0_freq"] = "0M"
+                        qcfg["ref_pad1_freq"] = lc.ref_clk_freq
+                    else:
+                        qcfg["ref_pad0_freq"] = lc.ref_clk_freq
                     break
 
         config[qkey] = qcfg
