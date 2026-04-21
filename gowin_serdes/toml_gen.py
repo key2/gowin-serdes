@@ -151,23 +151,24 @@ def _default_quad_config(
         "refmux_scheme": "USER_DEFINED",
     }
 
-    # Single-quad devices include mclk/gpio fields
-    if not is_multi:
+    # Single-quad devices include mclk/gpio fields (not GW5AT-60)
+    if not is_multi and not has_extra_pads:
         cfg["mclk_freq"] = "0M"
         cfg["gpio_freq"] = "0M"
-        cfg["ref_pad0_freq"] = "125M"
-    else:
+
+    if is_multi:
         # Multi-quad: routing defaults (overridden by _compute_refclk_routing)
         cfg["ref_prop_dir"] = 1
         cfg["refomux0_sel"] = 0
 
     if has_extra_pads:
-        cfg["ref_pad2_freq"] = "0M"
-        cfg["ref_pad3_freq"] = "0M"
+        # GW5AT-60: 4 gpio freq fields + 4 ref pads + 4 refimux
         cfg["gpio0_freq"] = "0M"
         cfg["gpio1_freq"] = "0M"
         cfg["gpio2_freq"] = "0M"
         cfg["gpio3_freq"] = "0M"
+        cfg["ref_pad2_freq"] = "0M"
+        cfg["ref_pad3_freq"] = "0M"
         cfg["refimux2_sel"] = 0
         cfg["refimux3_sel"] = 0
     return cfg
@@ -400,9 +401,13 @@ def _build_enabled_lane(
         "tx_if_cfg_rd_start_depth": 8,
         "tx_slip_distance": 8,
         "vddt": lane_cfg.vddt if lane_cfg.vddt is not None else 900.0,
-        "cpll_ref_sel": 0,
+        "cpll_ref_sel": (
+            _pll_ref_sel(device, lane_cfg.ref_clk_source)
+            if lane_cfg.pll == PLLSelection.CPLL
+            else 0
+        ),
     }
-    # GW5AT-15 includes extra fields not present in the 138K reference
+    # GW5AT-15 / GW5AT-60 include extra fields not present in 138K
     if not _is_138(device):
         cfg["rx_seperated_width_mode"] = str(lane_cfg.width_mode)
         cfg["10GBASE-R"] = False
@@ -417,57 +422,50 @@ def _build_enabled_lane(
 
 
 def _compute_refclk_routing(
+    device: GowinDevice,
     groups: List["GowinSerDesGroup"],
     num_quads: int,
+    has_extra_pads: bool,
 ) -> Dict[int, Dict[str, Any]]:
-    """Compute per-quad reference clock routing for multi-quad devices.
+    """Compute per-quad reference clock routing for all device types.
 
-    Analyses the ``ref_clk_source`` and ``pll`` attributes of all active
-    lanes and returns a dict mapping ``quad_id`` to a dict of routing
-    overrides (``ref_pad0_freq``, ``ref_pad1_freq``, ``refimux0_sel``,
-    ``refomux0_sel``, ``ref_prop_dir``).
+    Returns a dict mapping ``quad_id`` to a dict of routing overrides
+    that will be applied on top of ``_default_quad_config()``.
 
-    Routing rules (derived from Gowin IDE reference output for
-    GW5AST-138):
-
-    ===  ``refimux0_sel`` values  ===
-      0 – local pad 0
-      1 – forwarded from Q0 (used on Q1)
-      2 – forwarded from Q1 (used on Q0)
-      3 – local pad 1
-
-    ===  ``refomux0_sel`` values  ===
-      0 – forward pad 0 to neighbour (or none)
-      1 – forward pad 1 to neighbour
-
-    ===  ``ref_prop_dir``  ===
-      1 – Q0 → Q1
-      2 – Q1 → Q0
+    Handles three device families:
+    - **GW5AT-15** (single quad): ``ref_pad0/1_freq``, ``mclk_freq``,
+      ``gpio_freq``, ``refimux0_sel``, ``qpllX_ref_sel``
+    - **GW5AT-60** (single quad, extra pads): ``ref_pad0-3_freq``,
+      ``gpio0-3_freq``, ``refimux0/2_sel``, ``qpllX_ref_sel``
+    - **GW5A(S)T-138** (dual quad): full cross-quad routing with
+      ``ref_prop_dir``, ``refomux0_sel``
     """
     routing: Dict[int, Dict[str, Any]] = {}
+    is_multi = num_quads > 1
+
     for qi in range(num_quads):
-        routing[qi] = {
-            "ref_pad0_freq": "0M",
-            "ref_pad1_freq": "0M",
-            "refimux0_sel": 0,
-            "refomux0_sel": 0,
-            "ref_prop_dir": 1,
-        }
+        routing[qi] = {}
+        if is_multi:
+            routing[qi].update(
+                {
+                    "ref_pad0_freq": "0M",
+                    "ref_pad1_freq": "0M",
+                    "refimux0_sel": 0,
+                    "refomux0_sel": 0,
+                    "ref_prop_dir": 1,
+                }
+            )
 
     if not groups:
         return routing
 
-    # Determine the primary reference clock source from the first active
-    # lane.  All lanes should share the same ref_clk_source; if not, the
-    # first one determines the pad/routing topology.
     first_lc = groups[0].lane_configs[0]
     ref_src: RefClkSource = first_lc.ref_clk_source
     ref_freq: str = first_lc.ref_clk_freq
-
-    # Which quads have enabled lanes?
     active_quads = {g.quad for g in groups}
 
-    # Check whether Q0 has any QPLL lanes (affects a routing special case).
+    # Determine the PLL used (for qpll_ref_sel and special cases)
+    first_pll = first_lc.pll
     q0_uses_qpll = any(
         lc.pll in (PLLSelection.QPLL0, PLLSelection.QPLL1)
         for g in groups
@@ -475,57 +473,131 @@ def _compute_refclk_routing(
         for lc in g.lane_configs
     )
 
-    if ref_src == RefClkSource.Q0_REFCLK0:
-        # 125 MHz on Q0 pad 0
-        routing[0]["ref_pad0_freq"] = ref_freq
-        routing[0]["refimux0_sel"] = 0  # Q0 uses local pad 0
-        if 1 in active_quads and num_quads > 1:
-            routing[1]["refimux0_sel"] = 1  # Q1 receives from Q0
-        # prop_dir = 1 (Q0 → Q1)
-        for qi in range(num_quads):
-            routing[qi]["ref_prop_dir"] = 1
-
-    elif ref_src == RefClkSource.Q0_REFCLK1:
-        # 125 MHz on Q0 pad 1
-        routing[0]["ref_pad1_freq"] = ref_freq
-        routing[0]["refimux0_sel"] = 3  # Q0 uses local pad 1
-        if 1 in active_quads and num_quads > 1:
-            routing[1]["refimux0_sel"] = 1  # Q1 receives from Q0
-            routing[0]["refomux0_sel"] = 1  # Q0 forwards pad 1
-        for qi in range(num_quads):
-            routing[qi]["ref_prop_dir"] = 1
-
-    elif ref_src == RefClkSource.Q1_REFCLK0:
-        # Special case: when only Q0 lanes are active and all use CPLL,
-        # the Gowin IDE maps Q1_REFCLK0 to Q0's pad 1 instead of using
-        # cross-quad routing (CPLL needs a local reference path).
-        if 0 in active_quads and not q0_uses_qpll and 1 not in active_quads:
-            routing[0]["ref_pad1_freq"] = ref_freq
-            routing[0]["refimux0_sel"] = 3  # Q0 uses local pad 1
+    # ── Multi-quad (GW5A(S)T-138) routing ────────────────────────
+    if is_multi:
+        if ref_src == RefClkSource.Q0_REFCLK0:
+            routing[0]["ref_pad0_freq"] = ref_freq
+            if 1 in active_quads:
+                routing[1]["refimux0_sel"] = 1
             for qi in range(num_quads):
                 routing[qi]["ref_prop_dir"] = 1
-        else:
-            # Normal cross-quad: 125 MHz on Q1 pad 0, propagated to Q0
-            routing[1]["ref_pad0_freq"] = ref_freq
+
+        elif ref_src == RefClkSource.Q0_REFCLK1:
+            routing[0]["ref_pad1_freq"] = ref_freq
+            routing[0]["refimux0_sel"] = 3
             if 1 in active_quads:
-                routing[1]["refimux0_sel"] = 0  # Q1 uses local pad 0
+                routing[1]["refimux0_sel"] = 1
+                routing[0]["refomux0_sel"] = 1
+            for qi in range(num_quads):
+                routing[qi]["ref_prop_dir"] = 1
+
+        elif ref_src == RefClkSource.Q1_REFCLK0:
+            if 0 in active_quads and not q0_uses_qpll and 1 not in active_quads:
+                routing[0]["ref_pad1_freq"] = ref_freq
+                routing[0]["refimux0_sel"] = 3
+                for qi in range(num_quads):
+                    routing[qi]["ref_prop_dir"] = 1
+            else:
+                routing[1]["ref_pad0_freq"] = ref_freq
+                if 1 in active_quads:
+                    routing[1]["refimux0_sel"] = 0
+                if 0 in active_quads:
+                    routing[0]["refimux0_sel"] = 2
+                for qi in range(num_quads):
+                    routing[qi]["ref_prop_dir"] = 2
+
+        elif ref_src == RefClkSource.Q1_REFCLK1:
+            routing[1]["ref_pad1_freq"] = ref_freq
+            routing[1]["refomux0_sel"] = 1
+            if 1 in active_quads:
+                routing[1]["refimux0_sel"] = 3
             if 0 in active_quads:
-                routing[0]["refimux0_sel"] = 2  # Q0 receives from Q1
+                routing[0]["refimux0_sel"] = 2
             for qi in range(num_quads):
                 routing[qi]["ref_prop_dir"] = 2
 
-    elif ref_src == RefClkSource.Q1_REFCLK1:
-        # 125 MHz on Q1 pad 1
-        routing[1]["ref_pad1_freq"] = ref_freq
-        routing[1]["refomux0_sel"] = 1  # Q1 forwards pad 1
-        if 1 in active_quads:
-            routing[1]["refimux0_sel"] = 3  # Q1 uses local pad 1
-        if 0 in active_quads:
-            routing[0]["refimux0_sel"] = 2  # Q0 receives from Q1
-        for qi in range(num_quads):
-            routing[qi]["ref_prop_dir"] = 2
+        return routing
+
+    # ── Single-quad routing (GW5AT-15, GW5AT-60) ─────────────────
+    r = routing[0]
+
+    if ref_src == RefClkSource.Q0_REFCLK0:
+        r["ref_pad0_freq"] = ref_freq
+
+    elif ref_src == RefClkSource.Q0_REFCLK1:
+        r["ref_pad1_freq"] = ref_freq
+        r["refimux0_sel"] = 2  # pad1 via refimux0
+
+    elif ref_src == RefClkSource.Q0_REFCLK2:
+        # GW5AT-60: ref_pad2 on refimux2 group
+        r["ref_pad2_freq"] = ref_freq
+        # qppl/cpll ref_sel handled below
+
+    elif ref_src == RefClkSource.Q0_REFCLK3:
+        # GW5AT-60: ref_pad3 via refimux2=2
+        r["ref_pad3_freq"] = ref_freq
+        r["refimux2_sel"] = 2
+
+    elif ref_src == RefClkSource.Q0_REFIN:
+        # GW5AT-15: single REFIN → gpio_freq
+        r["gpio_freq"] = ref_freq
+
+    elif ref_src == RefClkSource.Q0_REFIN0:
+        # GW5AT-60: REFIN0 → gpio0_freq, refimux0=3
+        r["gpio0_freq"] = ref_freq
+        r["refimux0_sel"] = 3
+
+    elif ref_src == RefClkSource.Q0_REFIN1:
+        # GW5AT-60: REFIN1 → gpio1_freq, refimux0=1
+        r["gpio1_freq"] = ref_freq
+        r["refimux0_sel"] = 1
+
+    elif ref_src == RefClkSource.MCLK:
+        # GW5AT-15: management clock → mclk_freq
+        r["mclk_freq"] = ref_freq
+
+    # PLL reference select overrides (qpll0_ref_sel, qpll1_ref_sel)
+    pll_ref_sel = _pll_ref_sel(device, ref_src)
+    if pll_ref_sel != 0:
+        if first_pll == PLLSelection.QPLL0:
+            r["qpll0_ref_sel"] = pll_ref_sel
+        elif first_pll == PLLSelection.QPLL1:
+            r["qpll1_ref_sel"] = pll_ref_sel
 
     return routing
+
+
+def _pll_ref_sel(device: GowinDevice, ref_src: RefClkSource) -> int:
+    """Return the ``qpllX_ref_sel`` / ``cpll_ref_sel`` value for a refclk source.
+
+    GW5AT-15:
+      0 = refimux0 output (REFCLK0, REFCLK1)
+      2 = REFIN input
+      3 = MCLK input
+
+    GW5AT-60:
+      0 = refimux0 output (REFCLK0, REFCLK1, REFIN0, REFIN1)
+      2 = refimux2 output (REFCLK2, REFCLK3)
+
+    GW5A(S)T-138:
+      Always 0.
+    """
+    if _is_138(device):
+        return 0
+
+    if device == GowinDevice.GW5AT_15:
+        if ref_src == RefClkSource.Q0_REFIN:
+            return 2
+        if ref_src == RefClkSource.MCLK:
+            return 3
+        return 0
+
+    if device == GowinDevice.GW5AT_60:
+        if ref_src in (RefClkSource.Q0_REFCLK2, RefClkSource.Q0_REFCLK3):
+            return 2
+        return 0
+
+    return 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -546,13 +618,11 @@ def build_toml_config(
     meta = DEVICE_META[device]
     toml_device_name, _, num_quads, has_extra_pads = meta
 
-    is_multi = num_quads > 1
-
     # Determine which quads are in use
     used_quads = {g.quad for g in groups}
 
-    # Compute reference clock routing for multi-quad devices
-    refclk_routing = _compute_refclk_routing(groups, num_quads) if is_multi else None
+    # Compute reference clock routing for all devices
+    refclk_routing = _compute_refclk_routing(device, groups, num_quads, has_extra_pads)
 
     config: Dict[str, Any] = {
         "device": toml_device_name,
@@ -567,21 +637,9 @@ def build_toml_config(
             qi, enabled, has_extra_pads, num_quads, device=device
         )
 
-        if is_multi and refclk_routing:
-            # Apply computed routing overrides for multi-quad devices
+        # Apply computed routing overrides
+        if refclk_routing.get(qi):
             qcfg.update(refclk_routing[qi])
-        elif not is_multi and enabled:
-            # Single-quad: use the first lane's ref_clk_freq on the
-            # appropriate pad based on ref_clk_source.
-            for g in groups:
-                if g.quad == qi and g.lane_configs:
-                    lc = g.lane_configs[0]
-                    if lc.ref_clk_source == RefClkSource.Q0_REFCLK1:
-                        qcfg["ref_pad0_freq"] = "0M"
-                        qcfg["ref_pad1_freq"] = lc.ref_clk_freq
-                    else:
-                        qcfg["ref_pad0_freq"] = lc.ref_clk_freq
-                    break
 
         config[qkey] = qcfg
 

@@ -65,12 +65,14 @@ class PLLSelection(Enum):
 class RefClkSource(Enum):
     Q0_REFCLK0 = "Q0_REFCLK0"
     Q0_REFCLK1 = "Q0_REFCLK1"
+    Q0_REFCLK2 = "Q0_REFCLK2"  # GW5AT-60 only (has 4 ref pads)
+    Q0_REFCLK3 = "Q0_REFCLK3"  # GW5AT-60 only (has 4 ref pads)
     Q1_REFCLK0 = "Q1_REFCLK0"
     Q1_REFCLK1 = "Q1_REFCLK1"
-    Q0_REFIN0 = "Q0_REFIN0"
-    Q0_REFIN1 = "Q0_REFIN1"
-    Q0_REFIN = "Q0_REFIN"
-    MCLK = "MCLK"
+    Q0_REFIN = "Q0_REFIN"  # GW5AT-15 single REFIN (gpio_freq)
+    Q0_REFIN0 = "Q0_REFIN0"  # GW5AT-60 REFIN0 (gpio0_freq)
+    Q0_REFIN1 = "Q0_REFIN1"  # GW5AT-60 REFIN1 (gpio1_freq)
+    MCLK = "MCLK"  # GW5AT-15 management clock (mclk_freq)
     GPIO = "GPIO"
 
 

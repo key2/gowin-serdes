@@ -284,14 +284,6 @@ class GowinSerDes(Component):
                 my_port.rddata.eq(arbiter.drp_rddata[slot]),
                 my_port.resp.eq(arbiter.drp_resp[slot]),
             ]
-            # Response: arbiter → serdes port → user
-            m.d.comb += [
-                my_port.clk.eq(arbiter.drp_clk[slot]),
-                my_port.ready.eq(arbiter.drp_ready[slot]),
-                my_port.rdvld.eq(arbiter.drp_rdvld[slot]),
-                my_port.rddata.eq(arbiter.drp_rddata[slot]),
-                my_port.resp.eq(arbiter.drp_resp[slot]),
-            ]
         return m
 
     def _build_lane_port_map(self, lane, lane_idx, is_quadb):

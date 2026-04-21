@@ -81,7 +81,7 @@ QUAD_LANE_PORTS_COMMON = [
     ("FABRIC_LN{ln}_CPLL_IDDQ_I", "i", 1),
 ]
 
-# Ports only on GTR12_QUADB (GW5AT-15/60)
+# Ports only on GTR12_QUADB (GW5AT-15)
 QUAD_LANE_PORTS_QUADB_ONLY = [
     ("FABRIC_LANE{ln}_64B66B_TX_INVLD_BLK", "o", 1),
     ("FABRIC_LANE{ln}_64B66B_TX_FETCH", "o", 1),

@@ -305,10 +305,6 @@ class GowinUPARArbiter(Elaboratable):
             m.d[D] += self.upar_rden.eq(1)
         with m.Elif(~drp_wren_serdes & self.upar_rdvld):
             m.d[D] += self.upar_rden.eq(0)
-        with m.Elif(judg_addr_state_end & ~drp_addr_resp & ~drp_wren_serdes):
-            m.d[D] += self.upar_rden.eq(1)
-        with m.Elif(~drp_wren_serdes & self.upar_rdvld):
-            m.d[D] += self.upar_rden.eq(0)
 
         # Constants
         m.d.comb += [self.upar_rst.eq(0), self.upar_bus_width.eq(0)]
