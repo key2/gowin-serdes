@@ -812,9 +812,17 @@ BYPASS_8B10B = 0x00000001  # Bypass 8b10b encode/decode
 def lfps_ffe_regs(quad: int = 0, lane: int = 0) -> list:
     """Return FFE register (addr, normal_val, lfps_val, desc) tuples.
 
-    During LFPS signaling the TX driver must be reconfigured to produce
-    low-frequency square-wave signaling.  These three registers hold the
-    normal (high-speed) and LFPS (low-swing) FFE settings.
+    During LFPS signaling the TX driver must produce full-amplitude
+    low-frequency square-wave signaling (800-1200 mV per USB 3.2 spec).
+    This requires the same FFE settings as init — no de-emphasis,
+    full main cursor — so the TX driver outputs maximum differential
+    swing.
+
+    The working Gowin USB3 PHY reference (upar_csr.v FSM_FFE_WRITE)
+    never changes FFE_0 during LFPS; it keeps the init value
+    (0x0000F000) and only toggles FFE_1 between 0x0 (LFPS / no
+    de-emphasis) and 0x00000805 (normal data / de-emphasis).  FFE_2
+    is always reloaded with 0x00000110 to latch the new coefficients.
 
     Parameters
     ----------
@@ -829,9 +837,14 @@ def lfps_ffe_regs(quad: int = 0, lane: int = 0) -> list:
     q = Quad.Q0 if quad == 0 else Quad.Q1
     lc = LaneCSR(quad=q, lane=lane)
     return [
-        (lc.tx_ffe_0, 0x0000F000, 0x00000040, "TX FFE_0"),
-        (lc.tx_ffe_1, 0x00000000, 0x00000001, "TX FFE_1"),
-        (lc.tx_ffe_2, 0x00000110, 0x00000003, "TX FFE_2"),
+        (
+            lc.tx_ffe_0,
+            0x0000F000,
+            0x0000F000,
+            "TX FFE_0",
+        ),  # Unchanged: full main cursor
+        (lc.tx_ffe_1, 0x00000000, 0x00000000, "TX FFE_1"),  # No de-emphasis for LFPS
+        (lc.tx_ffe_2, 0x00000110, 0x00000110, "TX FFE_2"),  # Reload coefficients
     ]
 
 
