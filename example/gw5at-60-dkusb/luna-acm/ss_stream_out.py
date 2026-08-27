@@ -58,6 +58,15 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
         self.stream    = SuperSpeedStreamInterface()
         self.interface = SuperSpeedEndpointInterface()
 
+        # Optional accept gate: a packet is only accepted (and drained)
+        # when this is high at packet-completion time; otherwise it is
+        # NRDY'd and the host retransmits after our ERDY.  When left
+        # ``None`` the stream's own ``ready`` is used -- correct when the
+        # sink is packet-buffered (SuperSpeedStreamInEndpoint), whose
+        # ``ready`` implies a whole free packet buffer.  Drive it with a
+        # "room for a full packet" level when the sink is a FIFO.
+        self.packet_space = None
+
         # Debug taps (bring-up visibility; pruned when unused).
         self.debug_fill  = Signal(range(max_packet_size // 4 + 1))
         self.debug_total = Signal(range(max_packet_size // 4 + 1))
@@ -81,6 +90,10 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
         # Expected data packet sequence number [USB3.2r1: 8.12.1.2].
         expected_seq = Signal(self.SEQUENCE_NUMBER_BITS)
 
+        # Accept gate for completed packets (see ``packet_space`` above).
+        packet_space = self.packet_space if self.packet_space is not None \
+            else stream.ready
+
         # Is the packet currently on the rx interface for us?
         # (The DP header is fully parsed before payload words stream in.)
         is_our_packet = (
@@ -89,8 +102,14 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
         )
         seq_matches = (rx_header.data_sequence == expected_seq)
 
-        # Always tag our handshakes with our endpoint number.
-        m.d.comb += handshakes_out.endpoint_number.eq(self._endpoint_number)
+        # Always tag our handshakes with our endpoint number -- and with the
+        # OUT direction: NRDY/ERDY name the pipe they flow-control, and the
+        # shared generator's default direction for them is IN.
+        m.d.comb += [
+            handshakes_out.endpoint_number .eq(self._endpoint_number),
+            handshakes_out.direction       .eq(0),   # USBDirection.OUT
+            handshakes_out.direction_valid .eq(1),
+        ]
 
         # ── capture datapath ─────────────────────────────────────────────
         fill_count  = Signal(range(words + 1))      # words captured
@@ -141,16 +160,35 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
                 with m.If(interface.rx_complete & is_our_packet):
 
                     with m.If(seq_matches):
-                        m.d.ss += expected_seq.eq(expected_seq + 1)
 
                         with m.If(fill_count != 0):
-                            # Hand the payload to the stream, then ACK.
-                            m.d.ss += [
-                                total_words.eq(fill_count),
-                                position.eq(0),
-                                fetched.eq(0),
-                            ]
-                            m.next = "DRAIN"
+                            with m.If(packet_space):
+                                # Sink can take the packet: hand the payload
+                                # to the stream, then ACK.  (Paired with a
+                                # packet-buffered sink like
+                                # SuperSpeedStreamInEndpoint, ``ready`` here
+                                # means a whole free packet buffer, so the
+                                # drain below cannot stall mid-packet.)
+                                m.d.ss += [
+                                    expected_seq.eq(expected_seq + 1),
+                                    total_words.eq(fill_count),
+                                    position.eq(0),
+                                    fetched.eq(0),
+                                ]
+                                m.next = "DRAIN"
+                            with m.Else():
+                                # Sink full (e.g. the echo path is backed up
+                                # because the host hasn't read yet).  A DP
+                                # must never be left unanswered -- the host
+                                # retries it and errors the pipe out after
+                                # ~35 ms (-EPROTO).  Flow-control instead:
+                                # discard, answer NRDY, and reopen the pipe
+                                # with ERDY once the sink drains; the host
+                                # then retransmits this packet.
+                                # [USB3.2r1: 8.10.1]
+                                m.d.comb += handshakes_out.send_nrdy.eq(1)
+                                m.d.ss   += fill_count.eq(0)
+                                m.next = "AWAIT_SPACE"
                         with m.Else():
                             # Zero-length packet: just acknowledge it.
                             m.d.comb += [
@@ -159,7 +197,10 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
                                     .eq(expected_seq + 1),
                                 handshakes_out.send_ack.eq(1),
                             ]
-                            m.d.ss += fill_count.eq(0)
+                            m.d.ss += [
+                                expected_seq.eq(expected_seq + 1),
+                                fill_count.eq(0),
+                            ]
 
                     with m.Else():
                         # Unexpected sequence: discard, ask for the one we
@@ -218,6 +259,20 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
                     handshakes_out.send_ack.eq(1),
                 ]
                 m.next = "IDLE"
+
+            # AWAIT_SPACE -- we NRDY'd a packet because our sink was full.
+            # Wait for the sink to free a packet buffer, then reopen the
+            # pipe: the host retransmits the discarded packet after ERDY.
+            with m.State("AWAIT_SPACE"):
+                with m.If(packet_space):
+                    m.next = "SEND_ERDY"
+
+            # SEND_ERDY -- request that the host resume this pipe.  Held
+            # until the (shared) handshake generator confirms dispatch.
+            with m.State("SEND_ERDY"):
+                m.d.comb += handshakes_out.send_erdy.eq(1)
+                with m.If(handshakes_out.done):
+                    m.next = "IDLE"
 
         # Endpoint reset (SET_CONFIGURATION): back to sequence zero.
         # This is outside the FSM so it wins over any in-flight state.

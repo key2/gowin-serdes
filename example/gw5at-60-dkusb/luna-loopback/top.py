@@ -44,6 +44,7 @@ sys.path.insert(0, str(LUNA_ROOT))              # luna
 
 from amaranth.hdl import *
 from amaranth.lib.cdc import FFSynchronizer
+from amaranth.lib.fifo import SyncFIFOBuffered
 
 from dk_usb_gw5at60 import DKUSBGW5AT60Platform, add_serdes_refclk_forward
 
@@ -219,7 +220,34 @@ class LunaLoopbackTop(Elaboratable):
             generate_zlps=False)
         usb.add_endpoint(in_ep)
 
-        m.d.comb += in_ep.stream.stream_eq(out_ep.stream)
+        # Elastic loopback buffer: 64 KiB of BSRAM between the OUT and IN
+        # endpoints.  The OUT endpoint flow-controls (NRDY/ERDY) when this
+        # fills, which keeps the device protocol-correct at any host write
+        # depth; the depth itself lets single-threaded windowed tests (which
+        # write their whole window before the first read) run up to 64 KiB
+        # windows without engaging that backpressure.
+        fifo_depth = 16384                                # words = 64 KiB
+        fifo = SyncFIFOBuffered(width=32 + 4 + 1, depth=fifo_depth)
+        m.submodules.loop_fifo = DomainRenamer({"sync": "ss"})(fifo)
+
+        out_ep.packet_space = Signal()
+        m.d.comb += [
+            # OUT endpoint -> FIFO
+            fifo.w_data.eq(Cat(out_ep.stream.payload,
+                               out_ep.stream.valid,
+                               out_ep.stream.last)),
+            fifo.w_en.eq(out_ep.stream.valid.any() & fifo.w_rdy),
+            out_ep.stream.ready.eq(fifo.w_rdy),
+
+            # FIFO -> IN endpoint
+            in_ep.stream.payload.eq(fifo.r_data[0:32]),
+            in_ep.stream.valid.eq(Mux(fifo.r_rdy, fifo.r_data[32:36], 0)),
+            in_ep.stream.last.eq(fifo.r_data[36]),
+            fifo.r_en.eq(fifo.r_rdy & in_ep.stream.ready),
+
+            # Accept a data packet only when a whole max-size packet fits.
+            out_ep.packet_space.eq((fifo_depth - fifo.level) >= 260),
+        ]
 
         m.d.comb += led.o.eq(usb.link_trained)
 
@@ -348,7 +376,7 @@ def build(do_program=False):
 
 
 def flash():
-    bitstream = HERE / "build" / "luna_acm.fs"
+    bitstream = HERE / "build" / "luna_loopback.fs"
     if not bitstream.exists():
         sys.exit(f"no bitstream at {bitstream}; run `python top.py` first")
     cmd = ["openFPGALoader", "-c", "ft232", str(bitstream)]
