@@ -332,7 +332,39 @@ class DKUSBGW5AT60Platform(GowinPlatform):
         # constrain the SerDes fabric clocks by the nets feeding the PHY;
         # the vendor's own top.sdc uses 6.25 ns (160 MHz) for pclk on this
         # C2/I1 grade.  The board oscillator clocks are created by Amaranth.
-        if name == "usb31_enum":
+        #
+        # The LUNA tops (luna_enum / luna_acm) use the same serdes clock
+        # nets but not the vendor controller, so they get the clock+group
+        # constraints without the controller multicycle paths.  Without
+        # these, GowinSynthesis/PnR fall back to a 100 MHz default goal --
+        # while pclk really runs at 156.25 MHz (10G boot) / 125 MHz (5G):
+        # luna_enum only met 125 MHz by luck, and the first design with a
+        # bit more ss-domain logic (luna_acm) missed it and failed EP0
+        # handshakes on hardware ("Device not responding to setup address").
+        if name in ("luna_enum", "luna_acm"):
+            sdc_constraints = [
+                "create_clock -name pclk -period 6.4 "
+                "[get_nets {serdes_pcs_tx_clk_i}]",
+                "create_clock -name rxclk -period 6.4 "
+                "[get_nets {serdes_pcs_rx_clk_i}]",
+                "create_clock -name upar_clk -period 10.0 "
+                "[get_nets {serdes_upar_clk_i}]",
+                "",
+                "set_false_path -from [get_clocks {pclk}] "
+                "-to [get_clocks {rxclk upar_clk sys_clk_0__p "
+                "clk_24m_0__io}]",
+                "set_false_path -from [get_clocks {rxclk}] "
+                "-to [get_clocks {pclk upar_clk sys_clk_0__p "
+                "clk_24m_0__io}]",
+                "set_false_path -from [get_clocks {upar_clk}] "
+                "-to [get_clocks {pclk rxclk sys_clk_0__p "
+                "clk_24m_0__io}]",
+                "set_false_path -from [get_clocks {sys_clk_0__p}] "
+                "-to [get_clocks {pclk rxclk upar_clk clk_24m_0__io}]",
+                "set_false_path -from [get_clocks {clk_24m_0__io}] "
+                "-to [get_clocks {pclk rxclk upar_clk sys_clk_0__p}]",
+            ]
+        elif name == "usb31_enum":
             sdc_constraints = [
                 "create_clock -name pclk -period 6.4 "
                 "[get_nets {serdes_pcs_tx_clk_i}]",
