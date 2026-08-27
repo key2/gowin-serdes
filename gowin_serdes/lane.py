@@ -96,6 +96,7 @@ class GowinSerDesLane(Component):
         self._quad_tx_fifo_full = Signal(name="quad_tx_fifo_full")
         self._quad_stat = Signal(13, name="quad_stat")
         self._quad_astat = Signal(6, name="quad_astat")
+        self._quad_rxelecidle = Signal(name="quad_rxelecidle")
         self._quad_pma_rx_lock = Signal(name="quad_pma_rx_lock")
         self._quad_cmu_ok = Signal(name="quad_cmu_ok")
         self._quad_cmu_ck_ref = Signal(name="quad_cmu_ck_ref")
@@ -180,6 +181,8 @@ class GowinSerDesLane(Component):
         m.d.comb += [
             self.status.ready.eq(self._quad_stat[12]),
             self.status.signal_detect.eq(self._quad_astat[5]),
+            self.status.astat.eq(self._quad_astat),
+            self.status.rx_elecidle.eq(self._quad_rxelecidle),
             self.status.rx_cdr_lock.eq(self._quad_pma_rx_lock),
             self.status.pll_lock.eq(self._quad_cmu_ok),
             self.status.refclk.eq(self._quad_cmu_ck_ref),

@@ -119,6 +119,32 @@ GowinSerDes(wiring.Component)              <-- user instantiates this
 
 ---
 
+## USB3 Recipe (`usb3.py`)
+
+Everything needed to run a GTR12 lane under the Amaranth USB3.1 PHY
+(`gw_usb3`), extracted from and verified against the Gowin USB3.1 UVC
+reference design:
+
+- `usb3_lane_config(ref_clk_source, ref_clk_freq, boot_rate)` — lane
+  settings (Gen2 boot trim 10G/16-bit/1:4 by default, 5G trim available);
+- `USB3_QUAD_OVERRIDES` / `USB3_LANE_OVERRIDES` — the reference design's
+  deviations from the generator defaults;
+- `usb3_boot_writes(quad, lane)` — the two CSR writes the reference flow
+  appends after TOML→CSR conversion (TX AFE tuning + TX electrical idle
+  asserted, the state the PHY's CSR sequencer assumes at reset);
+- `make_usb3_serdes(device, quad, lane, ...)` — one-call construction;
+- `attach_usb3_phy(m, phy, lane, drp)` — the complete PHY↔lane↔DRP wiring,
+  table-driven by `PHY_LANE_WIRING` (note the deliberately crossed fabric
+  clocks, reproducing the reference `SerDes_Top`).
+
+Verification (GW_USB3 test suite): for the reference configuration
+(GW5AT-60, Q0 lane 1, 200 MHz on REFPAD1) the generated `serdes.toml` is
+**byte-identical** to the reference `serdes_tmp.toml` (canonical IDE key
+ordering lives in `toml_gen.py`), the generated `serdes.csr` is
+byte-identical to the shipped blob, the wiring table matches a net-level
+join of the reference `serdes.v`, and the UPAR arbiter is cycle-exact
+against the vendor RTL under cocotb.
+
 ## File Layout
 
 ```

@@ -41,6 +41,7 @@ class GowinSerDesGroup(Component):
         lane_configs: List[LaneConfig],
         chbond_master: Optional[int] = None,
         chbond_depth: ChannelBondingDepth = ChannelBondingDepth.NONE,
+        toml_quad_overrides: Optional[dict] = None,
     ):
         assert 1 <= len(lane_configs) <= 4
         assert 0 <= first_lane <= 3
@@ -51,6 +52,8 @@ class GowinSerDesGroup(Component):
         self.chbond_master = chbond_master
         self.chbond_depth = chbond_depth
         self.lane_configs = lane_configs
+        # Raw [qX] TOML section overrides (e.g. rx_eq_bias, por_toggle_by_fabric)
+        self.toml_quad_overrides = dict(toml_quad_overrides or {})
 
         # Create lane components
         self.lanes = [GowinSerDesLane(cfg) for cfg in lane_configs]

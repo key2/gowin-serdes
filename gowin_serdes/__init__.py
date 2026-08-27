@@ -29,8 +29,24 @@ from .lane import GowinSerDesLane
 from .group import GowinSerDesGroup
 from .serdes import GowinSerDes
 from .toml_gen import generate_toml, generate_csr
+from .usb3 import (
+    USB3_LANE_OVERRIDES,
+    USB3_QUAD_OVERRIDES,
+    PHY_LANE_WIRING,
+    attach_usb3_phy,
+    make_usb3_serdes,
+    usb3_boot_writes,
+    usb3_lane_config,
+)
 
 __all__ = [
+    "USB3_LANE_OVERRIDES",
+    "USB3_QUAD_OVERRIDES",
+    "PHY_LANE_WIRING",
+    "attach_usb3_phy",
+    "make_usb3_serdes",
+    "usb3_boot_writes",
+    "usb3_lane_config",
     # Config
     "GowinDevice",
     "OperationMode",

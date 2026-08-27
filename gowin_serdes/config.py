@@ -127,6 +127,13 @@ class LaneConfig:
     ffe_c0: Optional[int] = None  # Main cursor: 20–40
     ffe_c1: Optional[int] = None  # Post-cursor: 0–19
 
+    # ── Raw TOML overrides ───────────────────────────────────
+    # Applied last onto this lane's generated [qX.lnY] TOML section.
+    # Escape hatch for fields without a dedicated LaneConfig knob
+    # (e.g. {"rx_if_cfg_rd_start_depth": 3, "tx_if_cfg_rd_start_depth": 3}
+    # to reproduce the Gowin USB3.1 reference design settings).
+    toml_lane_overrides: dict = field(default_factory=dict)
+
     @property
     def ffe_manual(self) -> bool:
         """True when any FFE coefficient is explicitly set."""

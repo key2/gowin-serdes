@@ -105,6 +105,7 @@ class GowinSerDes(Component):
         output_path: str,
         toml_path: Optional[str] = None,
         gowin_bin_dir: Optional[str] = None,
+        extra_writes: Optional[list] = None,
     ) -> str:
         """Generate the ``.csr`` binary blob for this SerDes instance.
 
@@ -141,6 +142,7 @@ class GowinSerDes(Component):
             output_path,
             toml_path=toml_path,
             gowin_bin_dir=gowin_bin_dir,
+            extra_writes=extra_writes,
         )
 
     # ── Validation ─────────────────────────────────────────────
@@ -296,6 +298,7 @@ class GowinSerDes(Component):
             f"FABRIC_LN{li}_RXDATA_O": lane._quad_rxdata,
             f"FABRIC_LN{li}_RX_VLD_OUT": lane._quad_rx_vld,
             f"FABRIC_LN{li}_ASTAT_O": lane._quad_astat,
+            f"FABRIC_LN{li}_RXELECIDLE_O": lane._quad_rxelecidle,
             f"FABRIC_LN{li}_STAT_O": lane._quad_stat,
             f"FABRIC_LN{li}_PMA_RX_LOCK_O": lane._quad_pma_rx_lock,
             f"FABRIC_LANE{li}_CMU_CK_REF_O": lane._quad_cmu_ck_ref,

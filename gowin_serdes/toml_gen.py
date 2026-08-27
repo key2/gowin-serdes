@@ -605,6 +605,223 @@ def _pll_ref_sel(device: GowinDevice, ref_src: RefClkSource) -> int:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CANONICAL KEY ORDER (extracted from the Gowin IDE-generated serdes_tmp.toml
+# of the USB3.1 reference design, GW5AT-60).  Sections are re-ordered to this
+# canon so a generated TOML is byte-identical to the IDE output; keys unknown
+# to the canon (other device flavors) keep their insertion order at the end.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_IDE_QUAD_KEY_ORDER = (
+    "enable",
+    "rx_eq_bias",
+    "ref_pad1_freq",
+    "cmu0_reset_by_fabric",
+    "cmu1_reset_by_fabric",
+    "por_toggle_by_fabric",
+    "quad_clk_to_mac_sel",
+    "mac_quad_clk_sel",
+    "gpio0_freq",
+    "gpio1_freq",
+    "gpio2_freq",
+    "gpio3_freq",
+    "pd_toggle_by_fabric",
+    "lane_reset_by_fabric",
+    "ref_pad0_freq",
+    "ref_pad2_freq",
+    "ref_pad3_freq",
+    "rx_quad_clk_internal_sel",
+    "rx_quad_clk_sel",
+    "tx_quad_clk_internal_sel",
+    "tx_quad_clk_sel",
+    "refimux0_sel",
+    "refimux1_sel",
+    "refimux2_sel",
+    "refimux3_sel",
+    "qpll0_ref_sel",
+    "qpll1_ref_sel",
+    "refmux_scheme",
+)
+
+_IDE_LANE_KEY_ORDER_ENABLED = (
+    "tx_data_rate",
+    "rx_data_rate",
+    "pcs_tx_clk_src",
+    "loopBack",
+    "enable",
+    "width_mode",
+    "rx_seperated_width_mode",
+    "tx_gear_rate",
+    "rx_gear_rate",
+    "tx_if_cfg_rd_start_depth",
+    "rx_if_cfg_rd_start_depth",
+    "cpll_reset_by_fabric",
+    "chbond_align_pattern1",
+    "chbond_align_pattern1_is_kcode",
+    "chbond_align_pattern2",
+    "chbond_align_pattern2_is_kcode",
+    "chbond_align_pattern3",
+    "chbond_align_pattern3_is_kcode",
+    "preamEn",
+    "rxBistInv",
+    "rxPattern",
+    "txBistInv",
+    "txPattern",
+    "cdr_gc_counter",
+    "cdr_calib_clk_src",
+    "chbond_enable",
+    "chbond_align_length",
+    "chbond_align_pattern0",
+    "chbond_mst_sel",
+    "chbond_max_skew",
+    "ctc_enable",
+    "ctc_skipb_pattern",
+    "ctc_skipb_pattern_is_kcode",
+    "ctc_clk_src",
+    "ctc_mst_sel",
+    "ctc_skipa_pattern",
+    "ctc_rd_start_depth",
+    "pcs_rx_reset_by_fabric",
+    "pcs_tx_reset_by_fabric",
+    "10GBASE-R",
+    "ilk_metaframe_len",
+    "dr_rx_att",
+    "dr_rx_att_boost",
+    "rx_bit_invert",
+    "chbond_clk_src",
+    "chbond_cfg_rd_start_depth",
+    "dr_rx_boost",
+    "rx_byte_invert",
+    "rx_coupling",
+    "rx_data_manipulation_enable",
+    "decode_mode",
+    "eq_manual",
+    "locked_from_fabric",
+    "rx_ovs_mode",
+    "rx_ovs_pll_src",
+    "rx_ovs_ratio",
+    "rx_pol_invert",
+    "sr_sd_thsel",
+    "rx_slip_distance",
+    "idle_high_filter",
+    "idle_low_filter",
+    "rxsd_use_dlogic",
+    "chbond_trigger_by_fabric",
+    "ctc_skipb_pattern_enable",
+    "tx_bit_invert",
+    "tx_byte_invert",
+    "tx_data_manipulation_enable",
+    "txlev",
+    "encode_mode",
+    "ffe_c1",
+    "ffe_cm",
+    "ffe_manual",
+    "tx_if_cfg_mst_sel",
+    "tx_ovs_mode",
+    "tx_ovs_ratio",
+    "tx_pol_invert",
+    "tx_slip_distance",
+    "vddt",
+    "word_align_enable",
+    "comma",
+    "comma_mask",
+    "ffe_c0",
+    "cpll_ref_sel",
+)
+
+_IDE_LANE_KEY_ORDER_DISABLED = (
+    "cpll_reset_by_fabric",
+    "chbond_align_pattern1",
+    "chbond_align_pattern1_is_kcode",
+    "chbond_align_pattern2",
+    "chbond_align_pattern2_is_kcode",
+    "chbond_align_pattern3",
+    "chbond_align_pattern3_is_kcode",
+    "preamEn",
+    "rxBistInv",
+    "rxPattern",
+    "txBistInv",
+    "txPattern",
+    "cdr_gc_counter",
+    "cdr_calib_clk_src",
+    "chbond_enable",
+    "chbond_align_length",
+    "chbond_align_pattern0",
+    "chbond_mst_sel",
+    "chbond_max_skew",
+    "ctc_enable",
+    "ctc_skipb_pattern",
+    "ctc_skipb_pattern_is_kcode",
+    "ctc_clk_src",
+    "ctc_mst_sel",
+    "ctc_skipa_pattern",
+    "ctc_rd_start_depth",
+    "enable",
+    "loopBack",
+    "pcs_rx_reset_by_fabric",
+    "pcs_tx_reset_by_fabric",
+    "pcs_tx_clk_src",
+    "rx_seperated_width_mode",
+    "width_mode",
+    "10GBASE-R",
+    "ilk_metaframe_len",
+    "dr_rx_att",
+    "dr_rx_att_boost",
+    "rx_bit_invert",
+    "chbond_clk_src",
+    "chbond_cfg_rd_start_depth",
+    "dr_rx_boost",
+    "rx_byte_invert",
+    "rx_coupling",
+    "rx_data_manipulation_enable",
+    "decode_mode",
+    "eq_manual",
+    "rx_gear_rate",
+    "rx_if_cfg_rd_start_depth",
+    "locked_from_fabric",
+    "rx_ovs_mode",
+    "rx_ovs_pll_src",
+    "rx_ovs_ratio",
+    "rx_pol_invert",
+    "rx_data_rate",
+    "sr_sd_thsel",
+    "rx_slip_distance",
+    "idle_high_filter",
+    "idle_low_filter",
+    "rxsd_use_dlogic",
+    "chbond_trigger_by_fabric",
+    "ctc_skipb_pattern_enable",
+    "tx_bit_invert",
+    "tx_byte_invert",
+    "tx_data_manipulation_enable",
+    "txlev",
+    "encode_mode",
+    "ffe_c1",
+    "ffe_cm",
+    "ffe_manual",
+    "tx_gear_rate",
+    "tx_if_cfg_mst_sel",
+    "tx_if_cfg_rd_start_depth",
+    "tx_ovs_mode",
+    "tx_ovs_ratio",
+    "tx_pol_invert",
+    "tx_data_rate",
+    "tx_slip_distance",
+    "vddt",
+    "word_align_enable",
+    "comma",
+    "comma_mask",
+    "ffe_c0",
+    "cpll_ref_sel",
+)
+
+
+def _reorder_section(cfg, order):
+    known = {k: cfg[k] for k in order if k in cfg}
+    unknown = {k: v for k, v in cfg.items() if k not in known}
+    return {**known, **unknown}
+
+
 def build_toml_config(
     device: GowinDevice,
     groups: List["GowinSerDesGroup"],
@@ -641,7 +858,12 @@ def build_toml_config(
         if refclk_routing.get(qi):
             qcfg.update(refclk_routing[qi])
 
-        config[qkey] = qcfg
+        # Apply user quad-level TOML overrides from any group on this quad
+        for g in groups:
+            if g.quad == qi and getattr(g, "toml_quad_overrides", None):
+                qcfg.update(g.toml_quad_overrides)
+
+        config[qkey] = _reorder_section(qcfg, _IDE_QUAD_KEY_ORDER)
 
         # Create all 4 lane slots for this quad
         for li in range(4):
@@ -658,17 +880,32 @@ def build_toml_config(
                     break
 
             if lane_group is not None:
+                lane_cfg = lane_group.lane_configs[lane_offset]
                 lcfg_toml = _build_enabled_lane(
-                    lane_group.lane_configs[lane_offset],
+                    lane_cfg,
                     qi,
                     li,
                     lane_group,
                     device=device,
                 )
+                # Apply user lane-level TOML overrides last
+                if getattr(lane_cfg, "toml_lane_overrides", None):
+                    lcfg_toml.update(lane_cfg.toml_lane_overrides)
             else:
                 lcfg_toml = _default_lane_config(qi, li, device=device)
 
-            config[f"{qkey}.ln{li}"] = lcfg_toml
+            order = (_IDE_LANE_KEY_ORDER_ENABLED if lcfg_toml.get("enable")
+                     else _IDE_LANE_KEY_ORDER_DISABLED)
+            config[f"{qkey}.ln{li}"] = _reorder_section(lcfg_toml, order)
+
+        # The quad hard macro has a single fabric POR net tied to every
+        # lane's CPLL reset input; if any enabled lane declares
+        # cpll_reset_by_fabric, the disabled lanes share that wiring too
+        # (matches the Gowin reference design TOML).
+        if any(config[f"{qkey}.ln{li}"].get("cpll_reset_by_fabric") is True
+               for li in range(4)):
+            for li in range(4):
+                config[f"{qkey}.ln{li}"]["cpll_reset_by_fabric"] = True
 
     return config
 
@@ -705,12 +942,20 @@ def generate_csr(
     output_path: str,
     toml_path: Optional[str] = None,
     gowin_bin_dir: Optional[str] = None,
+    extra_writes: Optional[List[tuple]] = None,
 ) -> str:
     """Generate a ``.csr`` file from the live object graph.
 
     1. Writes a temporary (or caller-specified) TOML file.
     2. Invokes ``serdes_toml_to_csr_*k.bin <toml> -o <csr>``.
-    3. Returns the CSR output path.
+    3. Appends *extra_writes* as additional boot register writes.
+    4. Returns the CSR output path.
+
+    ``extra_writes`` is a list of ``(address, data)`` tuples appended after
+    the tool output as ``upar_write_driver(0x...,0x...)`` lines.  The Gowin
+    reference design flow appends such writes after TOML conversion (e.g.
+    the TX electrical-idle register so the boot state matches what the USB3
+    PHY's CSR sequencer assumes at reset).
 
     Parameters
     ----------
@@ -755,12 +1000,19 @@ def generate_csr(
     try:
         generate_toml(device, groups, toml_path)
 
-        # Invoke the Gowin binary
-        cmd = [tool_path, toml_path, "-o", output_path]
+        # Invoke the Gowin binary.  NB: the tool resolves paths relative to
+        # its own unpack directory, so absolute paths are mandatory.
+        cmd = [tool_path, os.path.abspath(toml_path),
+               "-o", os.path.abspath(output_path)]
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     finally:
         if cleanup_toml and os.path.exists(toml_path):
             os.remove(toml_path)
+
+    if extra_writes:
+        with open(output_path, "a") as f:
+            for addr, data in extra_writes:
+                f.write(f"upar_write_driver(0x{addr:06x},0x{data:08X})\n")
 
     return output_path
 

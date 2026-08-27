@@ -59,6 +59,11 @@ class LaneStatusSignature(Signature):
             "rx_cdr_lock": Out(1),
             "pll_lock": Out(1),
             "refclk": Out(1),
+            # full analog status bus (signal_detect is astat[5]) and the
+            # PMA receiver electrical-idle indication -- the Gowin USB3.1
+            # PHY consumes both directly
+            "astat": Out(6),
+            "rx_elecidle": Out(1),
         }
         if has_8b10b:
             members["k_lock"] = Out(1)
