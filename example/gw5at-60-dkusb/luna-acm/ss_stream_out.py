@@ -58,6 +58,11 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
         self.stream    = SuperSpeedStreamInterface()
         self.interface = SuperSpeedEndpointInterface()
 
+        # Debug taps (bring-up visibility; pruned when unused).
+        self.debug_fill  = Signal(range(max_packet_size // 4 + 1))
+        self.debug_total = Signal(range(max_packet_size // 4 + 1))
+        self.debug_pos   = Signal(range(max_packet_size // 4 + 1))
+
     def elaborate(self, platform):
         m = Module()
 
@@ -98,28 +103,39 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
             wr.en.eq(0),
         ]
 
+        m.d.comb += [
+            self.debug_fill.eq(fill_count),
+            self.debug_total.eq(total_words),
+        ]
+
         # ── drain sub-state ──────────────────────────────────────────────
         position = Signal(range(words + 1))
         fetched  = Signal()                          # rd.data matches position
+        draining = Signal()                          # buffer busy being read
         m.d.comb += rd.addr.eq(position)
 
+        m.d.comb += self.debug_pos.eq(position)
         last_word_of_drain = (position + 1 == total_words)
+
+        # Capture runs whenever the buffer is not being drained -- NOT only
+        # in the IDLE state: a packet's first word can arrive while the FSM
+        # spends its single cycle in ACK, and a state-gated capture would
+        # silently skip it (and then corrupt addressing via the stale fill
+        # count).  A compliant host cannot send during DRAIN (it has no
+        # credit until our ACK), so gating on ``draining`` alone is exact.
+        with m.If(~draining & rx_word_valid):
+            m.d.comb += wr.en.eq(1)
+            with m.If(rx.first):
+                m.d.comb += wr.addr.eq(0)
+                m.d.ss   += fill_count.eq(1)
+            with m.Else():
+                m.d.ss   += fill_count.eq(fill_count + 1)
 
         with m.FSM(domain="ss"):
 
-            # IDLE -- capture any packet addressed to us; adjudicate on the
-            # CRC strobes.
+            # IDLE -- adjudicate completed packets on the CRC strobes
+            # (payload capture runs continuously outside the FSM).
             with m.State("IDLE"):
-
-                # Capture payload words as they stream past.
-                with m.If(rx_word_valid):
-                    m.d.comb += wr.en.eq(1)
-                    with m.If(rx.first):
-                        # First word: restart the buffer.
-                        m.d.comb += wr.addr.eq(0)
-                        m.d.ss   += fill_count.eq(1)
-                    with m.Else():
-                        m.d.ss   += fill_count.eq(fill_count + 1)
 
                 # Packet concluded and CRC-valid.
                 with m.If(interface.rx_complete & is_our_packet):
@@ -168,6 +184,7 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
             # The host cannot send another packet yet (no ACK, NumP=1),
             # so the buffer is stable while we drain it.
             with m.State("DRAIN"):
+                m.d.comb += draining.eq(1)
 
                 # Wait one cycle for the (synchronous) read port.
                 with m.If(~fetched):
