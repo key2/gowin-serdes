@@ -433,7 +433,30 @@ class DKUSBGW5AT60Platform(GowinPlatform):
         merged = {**overrides, **kwargs}
         plan = super().toolchain_prepare(fragment, name, **merged)
         self._merge_diff_pair_constraints(plan, name)
+        self._apply_gowin_compat(plan, name)
         return plan
+
+    @staticmethod
+    def _apply_gowin_compat(plan, name):
+        """Post-process the emitted Verilog for GowinSynthesis quirks.
+
+        Forces ``syn_romstyle = "logic"`` on every module: GowinSynthesis
+        V1.9.12.03 mis-infers a functionally WRONG BSRAM pROM from the
+        Amaranth-emitted 8b/10b encoder tables (broken Gen1/5G TX on
+        hardware; the vendor PHY uses zero BSRAM).  See
+        gw_usb3/synthesis.py for the full story.
+        """
+        try:
+            from gw_usb3.synthesis import gowin_compat
+        except ImportError:
+            return
+        fname = f"{name}.v"
+        if fname not in plan.files:
+            return
+        text = plan.files[fname]
+        if isinstance(text, bytes):
+            text = text.decode()
+        plan.files[fname] = gowin_compat(text)
 
     @staticmethod
     def _merge_diff_pair_constraints(plan, name):

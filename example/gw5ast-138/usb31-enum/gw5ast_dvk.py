@@ -534,7 +534,21 @@ class GW5ASTDVKPlatform(GowinPlatform):
         }
         # Merge caller-provided kwargs with our overrides (caller wins)
         merged = {**overrides, **kwargs}
-        return super().toolchain_prepare(fragment, name, **merged)
+        plan = super().toolchain_prepare(fragment, name, **merged)
+        # GowinSynthesis pROM mis-inference workaround (broken Gen1 TX):
+        # force syn_romstyle="logic" on every emitted module, matching the
+        # vendor PHY's zero-BSRAM structure.  See gw_usb3/synthesis.py.
+        try:
+            from gw_usb3.synthesis import gowin_compat
+            fname = f"{name}.v"
+            if fname in plan.files:
+                text = plan.files[fname]
+                if isinstance(text, bytes):
+                    text = text.decode()
+                plan.files[fname] = gowin_compat(text)
+        except ImportError:
+            pass
+        return plan
 
     def toolchain_program(self, products, name, **kwargs):
         """Program the FPGA using openFPGALoader.
