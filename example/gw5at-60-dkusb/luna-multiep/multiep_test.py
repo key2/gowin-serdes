@@ -27,8 +27,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mib", nargs="?", type=float, default=4.0,
                     help="MiB to echo per endpoint pair (default 4)")
-    ap.add_argument("--eps", default="1,2,3",
-                    help="comma-separated endpoint numbers (default 1,2,3)")
+    ap.add_argument("--eps", default="1,2",
+                    help="comma-separated endpoint numbers (default 1,2; the\n"
+                         "shipping build has two pairs -- see top.py)")
     args = ap.parse_args()
 
     eps = [int(e) for e in args.eps.split(",")]

@@ -182,7 +182,8 @@ class LunaLoopbackTop(Elaboratable):
         drp = getattr(serdes, group.drp_name)
         m.d.comb += serdes.por_n.eq(por_n)
 
-        adapter = GowinGTR12PIPE(boot_rate_switch=(BOOT_RATE == "10G"))
+        adapter = GowinGTR12PIPE(boot_rate_switch=(BOOT_RATE == "10G"),
+                                 boot_domain="ss_raw")
         m.submodules.adapter = adapter
         attach_usb3_phy(m, adapter.phy, lane, drp)
 
@@ -190,7 +191,15 @@ class LunaLoopbackTop(Elaboratable):
         m.d.comb += ClockSignal("ss_raw").eq(lane.tx.pcs_clkout)
         rstn_r0 = Signal()
         rstn_r1 = Signal()
-        m.d.ss_raw += [rstn_r0.eq(luna_go), rstn_r1.eq(rstn_r0)]
+        # LUNA's ss/sync reset is released only once the adapter reports
+        # the boot rate switch COMPLETE (phy_ready): no LUNA state ever
+        # clocks at the 156.25 MHz boot rate or through the rate-change
+        # pclk retune (boot-window corruption class; HANDOVER 10k).  The
+        # adapter sequences the bring-up itself in the reset-free ss_raw
+        # domain, started by the POR chain.
+        m.d.comb += adapter.boot_start.eq(luna_go)
+        m.d.ss_raw += [rstn_r0.eq(luna_go & adapter.phy_ready),
+                       rstn_r1.eq(rstn_r0)]
         for dom in ("ss", "sync"):
             m.domains += ClockDomain(dom)
             m.d.comb += [

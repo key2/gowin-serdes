@@ -477,6 +477,12 @@ class DKUSBGW5AT60Platform(GowinPlatform):
         Amaranth-emitted 8b/10b encoder tables (broken Gen1/5G TX on
         hardware; the vendor PHY uses zero BSRAM).  See
         gw_usb3/synthesis.py for the full story.
+
+        Additionally hardens the LUNA endpoint multiplexer's module
+        boundary (``syn_hier = "hard"``): the cross-module optimizer
+        produced a functionally wrong netlist of its handshake arbiter
+        at seven endpoint interfaces (3 bulk pairs) -- the SET_ADDRESS
+        wedge of HANDOVER 10k.  A no-op for designs without the module.
         """
         try:
             from gw_usb3.synthesis import gowin_compat
@@ -488,7 +494,8 @@ class DKUSBGW5AT60Platform(GowinPlatform):
         text = plan.files[fname]
         if isinstance(text, bytes):
             text = text.decode()
-        plan.files[fname] = gowin_compat(text)
+        plan.files[fname] = gowin_compat(
+            text, hard_hier_patterns=(r"\.endpoint_mux$",))
 
     @staticmethod
     def _merge_diff_pair_constraints(plan, name):

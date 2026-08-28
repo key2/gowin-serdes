@@ -58,6 +58,21 @@ Env knobs:
                            n KiB in flight (>2 backs up the device's
                            2 KiB of echo buffering -- the hardware
                            failure mode)
+    ITP_EVERY=n            host sends an Isochronous Timestamp Packet
+                           every n cycles once trained (a real xHC sends
+                           one every 125 us = 15625 cycles; they consume
+                           header sequence numbers and credits and
+                           interleave with everything, incl. the
+                           SETUP/STATUS exchange)
+    HOST_LDN_EVERY=n       host interleaves an LDN keepalive link command
+                           every n cycles (real links are never silent)
+    CTRL_GAP=n             cycles the host waits between parsing the
+                           SETUP ack and sending the STATUS TP (scans the
+                           SETUP->STATUS hardware phase; default 0 = the
+                           historical immediate turnaround)
+    CTRL_PRE_GAP=n         cycles the host waits after link bringup
+                           before sending the SETUP (scans the phase
+                           against ITP/keepalive traffic)
     TRACE_LO/TRACE_HI      cycle window: print every parsed TX word
     WRITE_VCD=1            dump /tmp/kilo/link_loopback.vcd
 """
@@ -109,6 +124,10 @@ LBAD_EVERY   = int(os.environ.get("LBAD_EVERY", 0))
 BADHDR_EVERY = int(os.environ.get("BADHDR_EVERY", 0))
 HOST_BUBBLES = int(os.environ.get("HOST_BUBBLES", 0))
 WINDOW_KIB   = int(os.environ.get("WINDOW_KIB", 0))
+ITP_EVERY    = int(os.environ.get("ITP_EVERY", 0))
+HOST_LDN_EVERY = int(os.environ.get("HOST_LDN_EVERY", 0))
+CTRL_GAP     = int(os.environ.get("CTRL_GAP", 0))
+CTRL_PRE_GAP = int(os.environ.get("CTRL_PRE_GAP", 0))
 TRACE_LO     = int(os.environ.get("TRACE_LO", 0))
 TRACE_HI     = int(os.environ.get("TRACE_HI", 0))
 MPS          = 1024
@@ -276,6 +295,18 @@ def frame_lmp(subtype, dw0_extra=0, dw1=0):
     dw0 = HP_LMP | ((subtype & 0xF) << 5) | dw0_extra
     return {"dw0": dw0, "dw1": dw1, "dw2": 0, "payload": None,
             "kind": f"LMP({subtype})"}
+
+
+def frame_itp(cycle):
+    """Isochronous Timestamp Packet [USB3.2r1: 8.7]: broadcast, no
+    response expected, but consumes a header sequence number and a
+    credit like any header -- a real xHC sends one every bus interval,
+    interleaved with whatever else is in flight."""
+    bus_interval = (cycle // 15625) & 0x3FFF
+    delta = cycle % 8192
+    dw0 = HP_ITP | (bus_interval << 5) | (delta << 19)
+    return {"dw0": dw0, "dw1": 0, "dw2": 0, "payload": None,
+            "kind": f"ITP({bus_interval})"}
 
 
 def frame_to_words(frame, seq, *, delayed=0, corrupt=False):
@@ -683,6 +714,7 @@ def main():
         # control-transfer phase (WITH_CONTROL)
         "addressed": not WITH_CONTROL,
         "ctrl_step": 0,
+        "ctrl_wait": 0,
         # fault injection
         "dev_hdr_count": 0,           # device headers seen (for LBAD_EVERY)
         "host_hdr_count": 0,          # host headers sent (for BADHDR_EVERY)
@@ -1248,21 +1280,39 @@ def main():
                         for ep in EPS:
                             grant_in_token(ep)
 
+                # Background traffic a real xHC generates around (and
+                # during) the control exchange: periodic ITP headers and
+                # LDN keepalive link commands.
+                if ITP_EVERY and cycle % ITP_EVERY == 0:
+                    hp_queue.append(frame_itp(cycle))
+                if HOST_LDN_EVERY and cycle % HOST_LDN_EVERY == 0:
+                    lc_queue.extend(build_link_command(LC_LDN, 0))
+
                 # SET_ADDRESS control transfer, before any bulk traffic
                 # (mirrors real enumeration: it is the first transfer the
                 # host issues, and the first thing that broke on hardware).
+                # CTRL_PRE_GAP/CTRL_GAP scan the hardware phases: bringup->
+                # SETUP and SETUP-ack->STATUS turnaround respectively.
                 if WITH_CONTROL and not st["addressed"]:
                     if st["ctrl_step"] == 0:
-                        setup = bytes([0x00, 0x05, DEV_ADDRESS, 0x00,
-                                       0x00, 0x00, 0x00, 0x00])
-                        hp_queue.append(frame_out_dp(0, 0, setup,
-                                                     setup=1, address=0))
-                        log.add(cycle, "ctrl", "SETUP(SET_ADDRESS) sent")
-                        st["ctrl_step"] = 1
+                        if st["ctrl_wait"] < CTRL_PRE_GAP:
+                            st["ctrl_wait"] += 1
+                        else:
+                            st["ctrl_wait"] = 0
+                            setup = bytes([0x00, 0x05, DEV_ADDRESS, 0x00,
+                                           0x00, 0x00, 0x00, 0x00])
+                            hp_queue.append(frame_out_dp(0, 0, setup,
+                                                         setup=1, address=0))
+                            log.add(cycle, "ctrl", "SETUP(SET_ADDRESS) sent")
+                            st["ctrl_step"] = 1
                     elif st["ctrl_step"] == 2:
-                        hp_queue.append(frame_status_tp(0, address=0))
-                        log.add(cycle, "ctrl", "STATUS sent")
-                        st["ctrl_step"] = 3
+                        if st["ctrl_wait"] < CTRL_GAP:
+                            st["ctrl_wait"] += 1
+                        else:
+                            st["ctrl_wait"] = 0
+                            hp_queue.append(frame_status_tp(0, address=0))
+                            log.add(cycle, "ctrl", "STATUS sent")
+                            st["ctrl_step"] = 3
                 elif WITH_CONTROL and st["addressed"] and \
                         not st.get("pipes_open"):
                     st["pipes_open"] = True

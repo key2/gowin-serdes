@@ -78,11 +78,15 @@ BAUD_RATE = 115_200
 BOOT_RATE = "10G"           # proven: 10G boot + adapter rate switch to 5G
 
 # Loopback endpoint pairs (OUT 0x0n / IN 0x8n).  Two pairs are verified on
-# hardware.  A THREE-pair build reproducibly fails enumeration at the
-# SET_ADDRESS stage ("device not responding to setup address", -71) while
-# the same configuration passes the link-partner simulation including the
-# SET_ADDRESS contract check (WITH_CONTROL=1 NUM_EPS=3) -- open item, see
-# HANDOVER 10j.
+# hardware (16 MiB/EP simultaneous, 69.5 MB/s per direction each).
+#
+# THREE pairs: the SET_ADDRESS enumeration failure of HANDOVER 10j is
+# FIXED (GowinSynthesis all-ones-sentinel constant-fold in the endpoint
+# mux, HANDOVER 10k) and a 3-pair build now enumerates cleanly and moves
+# 114 MB/s aggregate across all three pipes -- but SUSTAINED 3-pipe
+# traffic hits a NEW intermittent failure (-71 EPROTO on two IN pipes
+# within ~µs of each other, link stays in U0, ~50% of 1 MiB/EP runs;
+# open item #23, HANDOVER 10k).  Flip to (1, 2, 3) when working on it.
 BULK_EPS = (1, 2)
 FIFO_WORDS = 4096           # per-pair elastic buffer: 16 KiB
 
@@ -191,15 +195,25 @@ class LunaMultiEpTop(Elaboratable):
         drp = getattr(serdes, group.drp_name)
         m.d.comb += serdes.por_n.eq(por_n)
 
-        adapter = GowinGTR12PIPE(boot_rate_switch=(BOOT_RATE == "10G"))
+        adapter = GowinGTR12PIPE(boot_rate_switch=(BOOT_RATE == "10G"),
+                                 boot_domain="ss_raw")
         m.submodules.adapter = adapter
         attach_usb3_phy(m, adapter.phy, lane, drp)
 
         m.domains += ClockDomain("ss_raw", reset_less=True)
         m.d.comb += ClockSignal("ss_raw").eq(lane.tx.pcs_clkout)
+        # LUNA's ss/sync reset is released only once the adapter reports
+        # the boot rate switch COMPLETE (phy_ready): no LUNA state ever
+        # clocks at the 156.25 MHz boot rate or through the rate-change
+        # pclk retune -- the boot window corrupted idle-but-clocking LUNA
+        # registers (dead TP generator path at 3 endpoint pairs; HANDOVER
+        # 10k).  The adapter sequences the bring-up itself in the
+        # reset-free ss_raw domain, started by the POR chain.
+        m.d.comb += adapter.boot_start.eq(luna_go)
         rstn_r0 = Signal()
         rstn_r1 = Signal()
-        m.d.ss_raw += [rstn_r0.eq(luna_go), rstn_r1.eq(rstn_r0)]
+        m.d.ss_raw += [rstn_r0.eq(luna_go & adapter.phy_ready),
+                       rstn_r1.eq(rstn_r0)]
         for dom in ("ss", "sync"):
             m.domains += ClockDomain(dom)
             m.d.comb += [
@@ -213,7 +227,7 @@ class LunaMultiEpTop(Elaboratable):
         m.submodules.usb = usb = USBSuperSpeedDevice(
             phy=adapter, sync_frequency=125e6)
 
-        usb.add_standard_control_endpoint(create_descriptors())
+        control_ep = usb.add_standard_control_endpoint(create_descriptors())
 
         in_eps = {}
         out_eps = {}
@@ -289,41 +303,59 @@ class LunaMultiEpTop(Elaboratable):
         m.submodules += FFSynchronizer(uart0.rx.i, rx0_unused,
                                        o_domain="dbg")
 
-        # uart 1: EP1 IN-endpoint transaction-ladder probe.
-        in_if = in_eps[BULK_EPS[0]].interface
-        out_ep0 = out_eps[BULK_EPS[0]]
-        in_token = Signal()
-        ep_tx_word = Signal()
-        echo_word = Signal()
-        erdy_done = Signal()
+        # uart 1: control-transfer (SET_ADDRESS) path probe.
+        #
+        # Localizes where the status ACK dies during the failing 3-pair
+        # enumeration.  Per second (0.35 s gate), a healthy SET_ADDRESS
+        # attempt contributes: ch0 +2 (SETUP ack + STATUS ack strobed at
+        # the control endpoint), ch1 +1 (STATUS TP received), ch2 +2
+        # (generator accepted both ACKs), ch3 +2 (both TPs entered the
+        # link header queue).  ch4 counts ss cycles in which the control
+        # interface has *latched* (fast-path-demoting) pending requests:
+        # any nonzero value means the same-cycle SET_ADDRESS contract is
+        # at risk; a huge value means a stuck pending bit.
+        # uart 1: control/handshake-path health probe.  Per gate window a
+        # healthy control transfer contributes: ch0 (any handshake
+        # dispatched) and ch2 (ACK dispatched) counts, ch1 counts received
+        # STATUS TPs, ch3 counts TPs entering the link queue; ch4 counts
+        # cycles the control interface has latched (fast-path-demoting)
+        # pending requests -- large values indicate the HANDOVER-10k
+        # arbiter wedge.
+        any_dispatch = Signal()
+        status_rx = Signal()
+        ack_dispatch = Signal()
+        tp_accepted = Signal()
+        pending0 = Signal()
+        recovery = Signal()
+        wrong_addr_ack = Signal()
         m.d.ss += [
-            in_token.eq(
-                in_if.handshakes_in.ack_received
-                & (in_if.handshakes_in.endpoint_number == BULK_EPS[0])
-                & (in_if.handshakes_in.number_of_packets != 0)),
-            ep_tx_word.eq(in_if.tx.valid.any() & in_if.tx.ready),
-            echo_word.eq(out_ep0.stream.valid.any() & out_ep0.stream.ready),
-            erdy_done.eq(in_if.handshakes_out.send_erdy
-                         & in_if.handshakes_out.done),
+            any_dispatch.eq(usb.debug_hsk_any_dispatch),
+            status_rx.eq(usb.debug_status_received),
+            ack_dispatch.eq(usb.debug_hsk_ack_dispatch),
+            tp_accepted.eq(usb.debug_tp_hdr_accepted),
+            pending0.eq(usb.debug_hsk_pending0),
+            recovery.eq(usb.debug_recovery),
+            wrong_addr_ack.eq(usb.debug_hsk_ep0_dispatch
+                              & usb.debug_address_nonzero),
         ]
 
         sticky_bits = Signal(3)
-        with m.If(erdy_done):
+        with m.If(pending0):
             m.d.ss += sticky_bits[0].eq(1)
-        with m.If(in_token):
+        with m.If(recovery):
             m.d.ss += sticky_bits[1].eq(1)
-        with m.If(ep_tx_word):
+        with m.If(wrong_addr_ack):
             m.d.ss += sticky_bits[2].eq(1)
         sticky_src = Cat(sticky_bits, usb.link_trained)
 
         uart1 = platform.request("uart", 1)
         m.submodules.clkprobe = clkprobe = DomainRenamer({"cfg": "dbg"})(
             ClockFreqProbe(clk_freq=DBG_FREQ, baud=BAUD_RATE, channels=(
-                ("ss", in_token),
-                ("ss", in_if.handshakes_out.send_nrdy),
-                ("ss", in_if.handshakes_out.send_erdy),
-                ("ss", ep_tx_word),
-                ("ss", echo_word),
+                ("ss", any_dispatch),
+                ("ss", status_rx),
+                ("ss", ack_dispatch),
+                ("ss", tp_accepted),
+                ("ss", pending0),
             )))
         dbg_flags = Signal(4)
         m.submodules += FFSynchronizer(sticky_src, dbg_flags, o_domain="dbg")
