@@ -341,7 +341,7 @@ class DKUSBGW5AT60Platform(GowinPlatform):
         # luna_enum only met 125 MHz by luck, and the first design with a
         # bit more ss-domain logic (luna_acm) missed it and failed EP0
         # handshakes on hardware ("Device not responding to setup address").
-        if name in ("luna_enum", "luna_acm", "luna_loopback"):
+        if name in ("luna_enum", "luna_acm", "luna_loopback", "luna_multiep"):
             sdc_constraints = [
                 "create_clock -name pclk -period 6.4 "
                 "[get_nets {serdes_pcs_tx_clk_i}]",

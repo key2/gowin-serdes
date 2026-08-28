@@ -38,7 +38,10 @@ Run:
     pdm run python gowin-serdes/example/gw5at-60-dkusb/luna-loopback/sim_link_loopback.py
 
 Env knobs:
-    LOOPBACK_BYTES=65536   total bytes echoed (default 16384)
+    LOOPBACK_BYTES=65536   total bytes echoed per endpoint (default 16384)
+    NUM_EPS=n              number of OUT->IN loopback endpoint pairs
+                           (EP1..EPn, default 1); traffic runs on all of
+                           them simultaneously
     LOOPBACK_SEED=1        payload PRNG seed
     HOST_GAP=0             idle ticks host inserts between its frames
     MAX_SKP_GAP=1800       wire bytes allowed between SKP ordered sets
@@ -78,6 +81,8 @@ from amaranth.sim import Simulator
 from luna.gateware.usb.stream import USBRawSuperSpeedStream
 from luna.gateware.usb.usb3.link.layer import USB3LinkLayer
 from luna.gateware.usb.usb3.physical.ctc import CTCSkipInserter, TxStreamSkidBuffer
+from luna.gateware.usb.usb3.endpoints.control import USB3ControlEndpoint
+from usb_protocol.emitters import SuperSpeedDeviceDescriptorCollection
 from luna.gateware.usb.usb3.protocol.layer import USB3ProtocolLayer
 from luna.gateware.usb.usb3.protocol.endpoint import SuperSpeedEndpointMultiplexer
 from luna.gateware.usb.usb3.endpoints.stream import SuperSpeedStreamInEndpoint
@@ -99,6 +104,7 @@ HOST_GAP     = int(os.environ.get("HOST_GAP", 0))
 # SKP rate and overruns the link partner's elastic buffer.
 MAX_SKP_GAP  = int(os.environ.get("MAX_SKP_GAP", 1800))
 NO_SKP_CHECK = int(os.environ.get("NO_SKP_CHECK", 0))
+WITH_CONTROL = int(os.environ.get("WITH_CONTROL", 0))
 LBAD_EVERY   = int(os.environ.get("LBAD_EVERY", 0))
 BADHDR_EVERY = int(os.environ.get("BADHDR_EVERY", 0))
 HOST_BUBBLES = int(os.environ.get("HOST_BUBBLES", 0))
@@ -107,7 +113,8 @@ TRACE_LO     = int(os.environ.get("TRACE_LO", 0))
 TRACE_HI     = int(os.environ.get("TRACE_HI", 0))
 MPS          = 1024
 DEV_ADDRESS  = 5
-BULK_EP      = 1
+NUM_EPS      = int(os.environ.get("NUM_EPS", 1))
+EPS          = list(range(1, NUM_EPS + 1))
 
 # Wire word constants (little-endian byte order, ctrl bit per byte).
 W_HPSTART = (0xF7FBFBFB, 0b1111)   # SHP SHP SHP EPF
@@ -250,11 +257,19 @@ def frame_ack_tp(*, ep, nseq, nump, retry=0, direction=1):
             "kind": f"ACK(nseq={nseq},rty={retry})"}
 
 
-def frame_out_dp(data_seq, payload: bytes):
-    dw0 = HP_DP | (DEV_ADDRESS << 25)
-    dw1 = (data_seq & 0x1F) | (0 << 7) | (BULK_EP << 8) | (len(payload) << 16)
+def frame_out_dp(ep, data_seq, payload: bytes, *, setup=0, address=DEV_ADDRESS):
+    dw0 = HP_DP | ((address & 0x7F) << 25)
+    dw1 = (data_seq & 0x1F) | (0 << 7) | ((ep & 0xF) << 8) \
+        | ((setup & 1) << 15) | (len(payload) << 16)
     return {"dw0": dw0, "dw1": dw1, "dw2": 0, "payload": payload,
-            "kind": f"DP(dseq={data_seq})"}
+            "kind": f"DP(ep={ep},dseq={data_seq}{',SETUP' if setup else ''})"}
+
+
+def frame_status_tp(ep=0, *, address=0):
+    dw0 = HP_TP | ((address & 0x7F) << 25)
+    dw1 = TP_STATUS | (1 << 7) | ((ep & 0xF) << 8)
+    return {"dw0": dw0, "dw1": dw1, "dw2": 0, "payload": None,
+            "kind": f"STATUS(ep={ep})"}
 
 
 def frame_lmp(subtype, dw0_extra=0, dw1=0):
@@ -314,16 +329,51 @@ class FakePhysicalLayer:
         self.can_send_skp             = Signal()
 
 
+def _control_descriptors():
+    d = SuperSpeedDeviceDescriptorCollection()
+    with d.DeviceDescriptor() as dev:
+        dev.bDeviceClass = 0xFF
+        dev.idVendor = 0x1209
+        dev.idProduct = 0x0001
+        dev.bcdUSB = 3.2
+        dev.bMaxPacketSize0 = 9
+        dev.iManufacturer = "sim"
+        dev.iProduct = "sim"
+        dev.iSerialNumber = "0"
+        dev.bNumConfigurations = 1
+    with d.ConfigurationDescriptor() as c:
+        c.bMaxPower = 50
+        with c.InterfaceDescriptor() as i:
+            i.bInterfaceNumber = 0
+            i.bInterfaceClass = 0xFF
+            for ep in EPS:
+                with i.EndpointDescriptor(add_default_superspeed=True) as e:
+                    e.bEndpointAddress = 0x80 | ep
+                    e.bmAttributes = 0x02
+                    e.wMaxPacketSize = 1024
+                with i.EndpointDescriptor(add_default_superspeed=True) as e:
+                    e.bEndpointAddress = ep
+                    e.bmAttributes = 0x02
+                    e.wMaxPacketSize = 1024
+    return d
+
+
 class LinkBench(Elaboratable):
     def __init__(self):
         self.phy = FakePhysicalLayer()
         self.link = USB3LinkLayer(physical_layer=self.phy, tseq_burst_length=32)
         self.protocol = USB3ProtocolLayer(link_layer=self.link)
         self.mux = SuperSpeedEndpointMultiplexer()
-        self.out_ep = SuperSpeedStreamOutEndpoint(
-            endpoint_number=BULK_EP, max_packet_size=MPS)
-        self.in_ep = SuperSpeedStreamInEndpoint(
-            endpoint_number=BULK_EP, max_packet_size=MPS, generate_zlps=False)
+        self.control_ep = None
+        if WITH_CONTROL:
+            self.control_ep = USB3ControlEndpoint()
+            self.control_ep.add_standard_request_handlers(
+                _control_descriptors())
+        self.out_eps = {ep: SuperSpeedStreamOutEndpoint(
+            endpoint_number=ep, max_packet_size=MPS) for ep in EPS}
+        self.in_eps = {ep: SuperSpeedStreamInEndpoint(
+            endpoint_number=ep, max_packet_size=MPS, generate_zlps=False)
+            for ep in EPS}
         # Real TX conditioning stages, exactly as in physical/layer.py
         # (minus the scrambler, which is data-neutral at this boundary).
         self.tx_skid = TxStreamSkidBuffer()
@@ -336,8 +386,9 @@ class LinkBench(Elaboratable):
         m.submodules.link = self.link
         m.submodules.protocol = self.protocol
         m.submodules.mux = self.mux
-        m.submodules.out_ep = self.out_ep
-        m.submodules.in_ep = self.in_ep
+        for ep in EPS:
+            m.submodules[f"out_ep{ep}"] = self.out_eps[ep]
+            m.submodules[f"in_ep{ep}"] = self.in_eps[ep]
         m.submodules.tx_skid = self.tx_skid
         m.submodules.tx_ctc = self.tx_ctc
 
@@ -359,16 +410,30 @@ class LinkBench(Elaboratable):
 
             proto_ep.handshakes_out   .connect(shared.handshakes_out),
             proto_ep.handshakes_in    .connect(shared.handshakes_in),
-
-            self.protocol.current_address.eq(DEV_ADDRESS),
-            self.link.current_address .eq(DEV_ADDRESS),
         ]
 
-        self.mux.add_interface(self.out_ep.interface)
-        self.mux.add_interface(self.in_ep.interface)
+        # Device address handling, as in USBSuperSpeedDevice: starts at 0,
+        # updated by the control endpoint on SET_ADDRESS.  Without a control
+        # endpoint we emulate an already-addressed device.
+        address = Signal(7, init=0 if WITH_CONTROL else DEV_ADDRESS)
+        with m.If(shared.address_changed):
+            m.d.ss += address.eq(shared.new_address)
+        m.d.comb += [
+            self.protocol.current_address.eq(address),
+            self.link.current_address .eq(address),
+        ]
 
-        # Bulk echo: OUT drains into IN.
-        m.d.comb += self.in_ep.stream.stream_eq(self.out_ep.stream)
+        if self.control_ep is not None:
+            m.submodules.control_ep = self.control_ep
+            self.mux.add_interface(self.control_ep.interface)
+
+        for ep in EPS:
+            self.mux.add_interface(self.out_eps[ep].interface)
+            self.mux.add_interface(self.in_eps[ep].interface)
+
+            # Bulk echo per pair: OUT drains into IN.
+            m.d.comb += self.in_eps[ep].stream.stream_eq(
+                self.out_eps[ep].stream)
 
         # TX conditioning: link sink -> skid -> skip inserter -> consumer,
         # with the insertion qualifier derived from the post-skid stream's
@@ -390,7 +455,7 @@ class SimViolation(Exception):
 
 
 class EventLog:
-    def __init__(self, depth=400):
+    def __init__(self, depth=int(os.environ.get('LOG_DEPTH', 400))):
         self.depth = depth
         self.events = []
 
@@ -509,6 +574,10 @@ class DevTxParser:
         info = {"dw0": dw0, "dw1": dw1, "dw2": dw2, "seq": seq,
                 "delayed": delayed, "type": ptype}
         if ptype == HP_DP:
+            self.log.add(self.cycle, "dev-DPH",
+                         f"seq={seq} ep={(dw1 >> 8) & 0xF} "
+                         f"dseq={dw1 & 0x1F} len={(dw1 >> 16) & 0xFFFF} "
+                         f"dl={delayed}")
             self.dpp = {
                 "data_seq": dw1 & 0x1F,
                 "direction": (dw1 >> 7) & 1,
@@ -594,8 +663,11 @@ def main():
     sim.add_clock(8e-9, domain="ss")
 
     rng = random.Random(SEED)
-    payload = bytes(rng.getrandbits(8) for _ in range(TOTAL_BYTES))
-    packets = [payload[i:i + MPS] for i in range(0, len(payload), MPS)]
+    payloads = {ep: bytes(rng.getrandbits(8) for _ in range(TOTAL_BYTES))
+                for ep in EPS}
+    packets = {ep: [payloads[ep][i:i + MPS]
+                    for i in range(0, TOTAL_BYTES, MPS)]
+               for ep in EPS}
 
     log = EventLog()
     phy = bench.phy
@@ -608,11 +680,9 @@ def main():
         "dev_adv_seen": False,        # device sent its LGOOD advertisement
         "dev_lcrd_next": 0,           # expected LCRD subtype cycle
         "dev_lgood_next": 0,          # expected LGOOD sequence
-        # host protocol state
-        "out_idx": 0, "out_seq": 0, "out_wait_ack": False,
-        "out_retry": 0, "out_nrdy": False, "out_retrans": 0,
-        "in_seq": 0, "in_parked": False, "in_token": False,
-        "rx_bytes": bytearray(),
+        # control-transfer phase (WITH_CONTROL)
+        "addressed": not WITH_CONTROL,
+        "ctrl_step": 0,
         # fault injection
         "dev_hdr_count": 0,           # device headers seen (for LBAD_EVERY)
         "host_hdr_count": 0,          # host headers sent (for BADHDR_EVERY)
@@ -626,6 +696,14 @@ def main():
         "done": False,
     }
 
+    # Per-endpoint-pair protocol state.
+    eps = {ep: {
+        "out_idx": 0, "out_seq": 0, "out_wait_ack": False,
+        "out_retry": 0, "out_nrdy": False, "out_retrans": 0,
+        "in_seq": 0, "in_parked": False, "in_token": False,
+        "rx_bytes": bytearray(),
+    } for ep in EPS}
+
     # Frames the host still has to transmit.  Link commands preempt
     # header frames; header frames consume a device rx-buffer credit.
     # Retried frames (after a device LBAD) bypass the credit gate.
@@ -634,45 +712,76 @@ def main():
     hp_resend = []     # list of (seq, frame) to retransmit with DL=1
     unacked = []       # list of (seq, frame) sent, awaiting device LGOOD
 
-    def fail(msg):
+    def fail(msg, ctx=None):
         log.dump()
         print(f"\nHOST-STATE: {_state_summary()}")
+        if ctx is not None:
+            for ep in EPS:
+                print(f"DEV ep{ep}: out_fsm={ctx.get(bench.out_eps[ep].debug_fsm)} "
+                      f"out_fill={ctx.get(bench.out_eps[ep].debug_fill)} "
+                      f"out_space={ctx.get(bench.out_eps[ep].stream.ready)} "
+                      f"in_fsm={ctx.get(bench.in_eps[ep].debug_fsm)} "
+                      f"in_wfill={ctx.get(bench.in_eps[ep].debug_write_fill)} "
+                      f"in_rfill={ctx.get(bench.in_eps[ep].debug_read_fill)} "
+                      f"in_rdy={ctx.get(bench.in_eps[ep].debug_ready)} "
+                      f"in_erdyreq={ctx.get(bench.in_eps[ep].debug_erdyreq)}")
+            print(f"DEV mux: pass_sel={ctx.get(bench.mux.debug_pass_sel)} "
+                  f"grant={ctx.get(bench.mux.debug_grant)} "
+                  f"pdisp={ctx.get(bench.mux.debug_pdisp)} "
+                  f"pending={[f'{ctx.get(p):04b}' for p in bench.mux.debug_pending]}")
+            print(f"DEV link: tx_credits={ctx.get(bench.link.debug_tx_credits)} "
+                  f"tx_pending={ctx.get(bench.link.debug_tx_pending)} "
+                  f"dtx_fsm={ctx.get(bench.link.debug_dtx_fsm)} "
+                  f"dsink_v={ctx.get(bench.link.debug_dsink_valid)} "
+                  f"dsink_r={ctx.get(bench.link.debug_dsink_ready)}")
         print(f"\nFAIL: {msg}")
         raise SystemExit(1)
 
     def _state_summary():
-        return (f"out_idx={st['out_idx']}/{len(packets)} "
-                f"out_seq={st['out_seq']} wait_ack={st['out_wait_ack']} "
-                f"in_seq={st['in_seq']} parked={st['in_parked']} "
-                f"token={st['in_token']} rx={len(st['rx_bytes'])}/{TOTAL_BYTES} "
+        per_ep = " ".join(
+            f"ep{ep}[out={e['out_idx']}/{len(packets[ep])}"
+            f" wa={int(e['out_wait_ack'])} nrdy={int(e['out_nrdy'])}"
+            f" iseq={e['in_seq']} park={int(e['in_parked'])}"
+            f" tok={int(e['in_token'])} rx={len(e['rx_bytes'])}"
+            f" rty={e['out_retry']} rtx={e['out_retrans']}]"
+            for ep, e in eps.items())
+        return (f"{per_ep} "
                 f"credits={st['host_tx_credits']} "
                 f"unacked={[s for s, _ in unacked]} "
                 f"lc={st['lc_counts']} hdr={st['hdr_counts']} "
                 f"nrdy={st['nrdy']} erdy={st['erdy']} acks={st['acks']} "
-                f"dps={st['dps']} out_rty={st['out_retry']} "
-                f"out_retrans={st['out_retrans']} "
+                f"dps={st['dps']} "
                 f"lbads_sent={st['lbads_sent']} lbads_taken={st['lbads_taken']} "
                 f"aborted_dps={st['aborted_dps']} "
+                f"tx_overlap={st.get('tx_overlap', 0)} "
                 f"max_skp_gap={st['max_skp_gap']}")
 
     # -- host protocol reactions -----------------------------------------
 
-    def grant_in_token(nump=1, retry=0):
-        hp_queue.append(frame_ack_tp(ep=BULK_EP, nseq=st["in_seq"],
+    def grant_in_token(ep, nump=1, retry=0):
+        e = eps[ep]
+        hp_queue.append(frame_ack_tp(ep=ep, nseq=e["in_seq"],
                                      nump=nump, retry=retry, direction=1))
-        st["in_token"] = True
+        e["in_token"] = True
 
     def alloc_hdr_seq():
         seq = st["host_hdr_seq"]
         st["host_hdr_seq"] = (seq + 1) & 0x7
         return seq
 
-    def send_next_out(cycle):
-        idx = st["out_idx"]
-        data = packets[idx]
-        hp_queue.append(frame_out_dp(st["out_seq"], data))
-        st["out_wait_ack"] = True
-        log.add(cycle, "host-OUT", f"idx={idx} dseq={st['out_seq']} "
+    def out_dp_queued(ep):
+        """Is a copy of this endpoint's OUT DP already queued for (re)send?"""
+        tag = f"DP(ep={ep},"
+        return any(f["kind"].startswith(tag) for f in hp_queue) or \
+            any(f["kind"].startswith(tag) for _s, f in hp_resend)
+
+    def send_next_out(ep, cycle):
+        e = eps[ep]
+        idx = e["out_idx"]
+        data = packets[ep][idx]
+        hp_queue.append(frame_out_dp(ep, e["out_seq"], data))
+        e["out_wait_ack"] = True
+        log.add(cycle, "host-OUT", f"ep={ep} idx={idx} dseq={e['out_seq']} "
                                    f"len={len(data)}")
 
     def _lbad_this_header(info, cycle):
@@ -781,8 +890,9 @@ def main():
                 return
             st["aborted_dps"] += 1
             host_ack_header(info["seq"])
-            log.add(cycle, "dev-DP-abort", f"dseq={info['data_seq']}")
-            grant_in_token(retry=1)
+            log.add(cycle, "dev-DP-abort",
+                    f"ep={info['ep']} dseq={info['data_seq']}")
+            grant_in_token(info["ep"], retry=1)
             st["progress_cycle"] = cycle
 
     def host_ack_header(seq):
@@ -799,79 +909,132 @@ def main():
         ep = (dw1 >> 8) & 0xF
         nump = (dw1 >> 16) & 0x1F
         nseq = (dw1 >> 21) & 0x1F
-        if ep != BULK_EP:
+
+        if WITH_CONTROL and ep == 0:
+            # SET_ADDRESS control transfer: SETUP ACK, then the status ACK.
+            tp_addr = (info["dw0"] >> 25) & 0x7F
+            if subtype != TP_ACK:
+                fail(f"unexpected EP0 TP subtype {subtype}")
+            if st["ctrl_step"] == 1:
+                log.add(cycle, "ctrl", f"SETUP acked (addr={tp_addr})")
+                st["ctrl_step"] = 2
+            elif st["ctrl_step"] == 3:
+                # THE SET_ADDRESS CONTRACT: the status-stage ACK must still
+                # carry the *old* (zero) address [USB3.2r1: 8.5.1 / 9.4.6].
+                if tp_addr != 0:
+                    fail(f"SET_ADDRESS status ACK sent from the NEW address "
+                         f"{tp_addr}; the host discards it (-71 'device not "
+                         f"responding to setup address')")
+                log.add(cycle, "ctrl", "STATUS acked from address 0")
+                st["addressed"] = True
+                st["progress_cycle"] = cycle
+            else:
+                fail(f"unexpected EP0 ACK at ctrl_step {st['ctrl_step']}")
+            return
+
+        if ep not in EPS:
             fail(f"TP for unexpected endpoint {ep}")
+        e = eps[ep]
 
         if subtype == TP_ACK:
             st["acks"] += 1
-            log.add(cycle, "dev-ACK", f"nseq={nseq} rty={retry} nump={nump}")
-            if not st["out_wait_ack"]:
-                fail(f"unsolicited device ACK (nseq={nseq} rty={retry})")
-            if retry or nseq == st["out_seq"]:
-                # device requests retransmission of the current packet
-                st["out_retry"] += 1
-                log.add(cycle, "host-retry", f"dseq={st['out_seq']}")
-                st["out_wait_ack"] = False
-            elif nseq == ((st["out_seq"] + 1) & 0x1F):
-                st["out_seq"] = nseq
-                st["out_idx"] += 1
-                st["out_wait_ack"] = False
-                st["progress_cycle"] = cycle
+            log.add(cycle, "dev-ACK",
+                    f"ep={ep} nseq={nseq} rty={retry} nump={nump}")
+            # Sequence-driven, like an xHC: the advertised next-expected
+            # sequence decides; a retry bit or repeated sequence asks for a
+            # (re)transmission of the current packet.  Duplicate responses
+            # (possible when link-level retries overlap protocol retries)
+            # are ignored.
+            if nseq == ((e["out_seq"] + 1) & 0x1F):
+                if e["out_wait_ack"]:
+                    e["out_seq"] = nseq
+                    e["out_idx"] += 1
+                    e["out_wait_ack"] = False
+                    st["progress_cycle"] = cycle
+                # else: duplicate ACK of an already-completed packet.
+            elif nseq == e["out_seq"]:
+                # Device expects the current packet (again).
+                if e["out_wait_ack"]:
+                    e["out_retry"] += 1
+                    log.add(cycle, "host-retry",
+                            f"ep={ep} dseq={e['out_seq']}")
+                    e["out_wait_ack"] = False
+                # else: a (re)send is already queued; nothing to do.
             else:
-                fail(f"device ACK with unexpected nseq {nseq} "
-                     f"(out_seq={st['out_seq']})")
+                fail(f"device ACK ep={ep} with unexpected nseq {nseq} "
+                     f"(out_seq={e['out_seq']})")
         elif subtype == TP_NRDY:
             st["nrdy"] += 1
-            log.add(cycle, "dev-NRDY", f"dir={direction}")
+            log.add(cycle, "dev-NRDY", f"ep={ep} dir={direction}")
             if direction == 1:
                 # IN pipe: stop polling until ERDY.
-                st["in_parked"] = True
-                st["in_token"] = False
+                e["in_parked"] = True
+                e["in_token"] = False
             else:
                 # OUT pipe: the device discarded our unacknowledged DP;
-                # hold it for retransmission after ERDY.
-                if not st["out_wait_ack"]:
-                    fail("OUT NRDY with no outstanding OUT packet")
-                st["out_nrdy"] = True
+                # hold it for retransmission after ERDY.  With link-level
+                # retries in play this can also be the response to our own
+                # DL-replay of an already-acknowledged DP -- stale, and
+                # ignorable like an xHC ignores responses for completed
+                # transfers (the next DP just gets flow-controlled again).
+                if e["out_wait_ack"]:
+                    e["out_nrdy"] = True
+                else:
+                    log.add(cycle, "host-note",
+                            f"stale OUT NRDY ep={ep} ignored")
         elif subtype == TP_ERDY:
             st["erdy"] += 1
-            log.add(cycle, "dev-ERDY", f"dir={direction}")
+            log.add(cycle, "dev-ERDY", f"ep={ep} dir={direction}")
             if direction == 1:
-                st["in_parked"] = False
+                e["in_parked"] = False
             else:
                 # OUT pipe reopened: retransmit the NRDY'd packet.
-                if st["out_nrdy"]:
-                    st["out_nrdy"] = False
-                    st["out_retrans"] += 1
-                    st["out_wait_ack"] = False   # main loop re-sends out_idx
+                if e["out_nrdy"]:
+                    e["out_nrdy"] = False
+                    e["out_retrans"] += 1
+                    e["out_wait_ack"] = False   # main loop re-sends out_idx
                     st["progress_cycle"] = cycle
         else:
             fail(f"unexpected TP subtype {subtype}")
 
     def _handle_in_dp(info, cycle):
         st["dps"] += 1
-        if info["ep"] != BULK_EP or info["direction"] != 1:
-            fail(f"DP from unexpected source ep={info['ep']} "
+        ep = info["ep"]
+        if ep not in EPS or info["direction"] != 1:
+            fail(f"DP from unexpected source ep={ep} "
                  f"dir={info['direction']}")
+        e = eps[ep]
         dseq = info["data_seq"]
-        log.add(cycle, "dev-DP", f"dseq={dseq} len={len(info['payload'])}")
-        if dseq != st["in_seq"]:
-            fail(f"device DP sequence {dseq}, expected {st['in_seq']}")
-        pos = len(st["rx_bytes"])
-        expect = payload[pos:pos + len(info["payload"])]
+        log.add(cycle, "dev-DP",
+                f"ep={ep} dseq={dseq} len={len(info['payload'])}")
+        if dseq != e["in_seq"]:
+            fail(f"device DP ep={ep} sequence {dseq}, "
+                 f"expected {e['in_seq']}")
+        pos = len(e["rx_bytes"])
+        expect = payloads[ep][pos:pos + len(info["payload"])]
         if info["payload"] != expect:
             for i, (a, b) in enumerate(zip(info["payload"], expect)):
                 if a != b:
                     break
-            fail(f"echo data corruption in DP dseq={dseq}: first diff at "
-                 f"byte {pos + i}: got {info['payload'][i]:02x}, expected "
-                 f"{expect[i]:02x}")
-        st["rx_bytes"].extend(info["payload"])
-        st["in_seq"] = (st["in_seq"] + 1) & 0x1F
-        st["in_token"] = False
+            # Identify what was actually delivered: search all endpoint
+            # payload streams for the received bytes.
+            needle = bytes(info["payload"][:64])
+            origin = "unknown"
+            for oep in EPS:
+                off = payloads[oep].find(needle)
+                if off >= 0:
+                    origin = (f"ep{oep} offset {off} "
+                              f"(packet {off // MPS}, +{off % MPS})")
+                    break
+            fail(f"echo data corruption ep={ep} DP dseq={dseq}: first diff "
+                 f"at byte {pos + i}: got {info['payload'][i]:02x}, "
+                 f"expected {expect[i]:02x}; delivered bytes are {origin}")
+        e["rx_bytes"].extend(info["payload"])
+        e["in_seq"] = (e["in_seq"] + 1) & 0x1F
+        e["in_token"] = False
         st["progress_cycle"] = cycle
         # ACK doubles as the next IN token, like an xHC.
-        grant_in_token()
+        grant_in_token(ep)
 
     parser = DevTxParser(log, dispatch)
 
@@ -913,6 +1076,13 @@ def main():
                 frame = hp_queue.pop(0)
                 seq = alloc_hdr_seq()
                 unacked.append((seq, frame))
+                if len(unacked) > 8:
+                    # Sending is credit-gated (<=4 outstanding per the
+                    # device's own buffer count); more than 8 un-LGOODed
+                    # headers means the device is dropping LGOODs (a real
+                    # host's 5 ms PENDING_HP_TIMER then forces Recovery).
+                    fail(f"LGOOD starvation: {len(unacked)} headers "
+                         f"unacknowledged: {[s for s, _ in unacked]}")
                 st["host_hdr_count"] += 1
                 corrupt = bool(BADHDR_EVERY) and \
                     st["host_hdr_count"] > 4 and \
@@ -953,8 +1123,58 @@ def main():
                          f"{parser.state}")
             st["max_skp_gap"] = max(st["max_skp_gap"], st["skp_gap"])
 
+            # ── generator-dispatch tracing (multi-EP debug) ───────────
+            if st["trained_seen"] and NUM_EPS > 1:
+                sho = bench.mux.shared.handshakes_out
+                if ctx.get(sho.ready):
+                    kindbits = (ctx.get(sho.send_ack),
+                                ctx.get(sho.send_nrdy),
+                                ctx.get(sho.send_erdy),
+                                ctx.get(sho.send_stall))
+                    if any(kindbits):
+                        log.add(cycle, "gen-dispatch",
+                                f"a{kindbits[0]}n{kindbits[1]}"
+                                f"e{kindbits[2]}s{kindbits[3]} "
+                                f"ep={ctx.get(sho.endpoint_number)} "
+                                f"dir={ctx.get(sho.direction)} "
+                                f"psel={ctx.get(bench.mux.debug_pass_sel)} "
+                                f"grant={ctx.get(bench.mux.debug_grant)} "
+                                f"gkind={ctx.get(bench.mux.debug_grant_kind):04b}")
+
+            # ── handshake-interface tracing (multi-EP debug) ──────────
+            if st["trained_seen"] and NUM_EPS > 1:
+                for ep in EPS:
+                    for pfx, epi in (("o", bench.out_eps[ep]),
+                                     ("i", bench.in_eps[ep])):
+                        hso = epi.interface.handshakes_out
+                        snap = (ctx.get(hso.send_ack), ctx.get(hso.send_nrdy),
+                                ctx.get(hso.send_erdy), ctx.get(hso.done),
+                                ctx.get(epi.debug_fsm))
+                        key = f"_hs_{pfx}{ep}"
+                        if snap != st.get(key):
+                            st[key] = snap
+                            log.add(cycle, f"hs-{pfx}{ep}",
+                                    f"ack={snap[0]} nrdy={snap[1]} "
+                                    f"erdy={snap[2]} done={snap[3]} "
+                                    f"fsm={snap[4]}")
+
+            # ── endpoint TX overlap diagnostics ───────────────────────
+            if st["trained_seen"] and NUM_EPS > 1:
+                n_valid = sum(1 for ep in EPS
+                              if ctx.get(bench.in_eps[ep].stream.valid))
+                # bench.in_eps[ep].stream is the *loopback* input; the TX
+                # side is interface.tx:
+                n_tx = sum(1 for ep in EPS
+                           if ctx.get(bench.in_eps[ep].interface.tx.valid))
+                if n_tx > 1:
+                    st["tx_overlap"] = st.get("tx_overlap", 0) + 1
+
             # ── recovery-cause diagnostics ────────────────────────────
             if st["trained_seen"]:
+                if ctx.get(bench.link.debug_payload_underrun):
+                    fail(f"cycle {cycle}: transmitter consumed an INVALID "
+                         f"payload word (gapless-feed contract violation)",
+                         ctx)
                 for name, sig in (("rec-timers", bench.link.debug_rec_timers),
                                   ("rec-rx", bench.link.debug_rec_rx),
                                   ("rec-tx", bench.link.debug_rec_tx),
@@ -1023,34 +1243,62 @@ def main():
                     hp_queue.append(frame_lmp(4, dw0_extra=(1 << 9),
                                               dw1=(4 | (1 << 16))))
                     hp_queue.append(frame_lmp(5, dw0_extra=(1 << 9)))
-                    # open the IN pipe
-                    grant_in_token()
+                    if not WITH_CONTROL:
+                        # open the IN pipes
+                        for ep in EPS:
+                            grant_in_token(ep)
 
-                # protocol engines: keep the OUT pipe saturated.  With
-                # WINDOW_KIB, mimic window_test.py: never have more than
-                # WINDOW_KIB KiB unread in flight.
-                window_ok = (not WINDOW_KIB or
-                             (st["out_idx"] + 1) * MPS - len(st["rx_bytes"])
-                             <= WINDOW_KIB * 1024)
-                if (not st["out_wait_ack"]
-                        and st["out_idx"] < len(packets)
-                        and window_ok
-                        and len(hp_queue) < 2):
-                    send_next_out(cycle)
-                # keep the IN pipe polled; with WINDOW_KIB the reader only
-                # starts once the initial window has been written -- or once
-                # the writer is flow-controlled (a concurrent reader, as in
-                # bandwidth_test.py or cdc-acm, is always running; only the
-                # single-threaded window_test.py truly serializes, and that
-                # case is covered on hardware by the deep loopback FIFO).
-                reads_started = (not WINDOW_KIB or
-                                 st["out_idx"] * MPS >= WINDOW_KIB * 1024
-                                 or st["out_nrdy"]
-                                 or st["out_idx"] >= len(packets))
-                if (reads_started
-                        and not st["in_parked"] and not st["in_token"]
-                        and len(st["rx_bytes"]) < TOTAL_BYTES):
-                    grant_in_token()
+                # SET_ADDRESS control transfer, before any bulk traffic
+                # (mirrors real enumeration: it is the first transfer the
+                # host issues, and the first thing that broke on hardware).
+                if WITH_CONTROL and not st["addressed"]:
+                    if st["ctrl_step"] == 0:
+                        setup = bytes([0x00, 0x05, DEV_ADDRESS, 0x00,
+                                       0x00, 0x00, 0x00, 0x00])
+                        hp_queue.append(frame_out_dp(0, 0, setup,
+                                                     setup=1, address=0))
+                        log.add(cycle, "ctrl", "SETUP(SET_ADDRESS) sent")
+                        st["ctrl_step"] = 1
+                    elif st["ctrl_step"] == 2:
+                        hp_queue.append(frame_status_tp(0, address=0))
+                        log.add(cycle, "ctrl", "STATUS sent")
+                        st["ctrl_step"] = 3
+                elif WITH_CONTROL and st["addressed"] and \
+                        not st.get("pipes_open"):
+                    st["pipes_open"] = True
+                    for ep in EPS:
+                        grant_in_token(ep)
+
+                # protocol engines, per endpoint pair: keep the OUT pipes
+                # saturated.  With WINDOW_KIB, mimic window_test.py: never
+                # have more than WINDOW_KIB KiB unread in flight per pipe.
+                for ep in (EPS if st["addressed"] else ()):
+                    e = eps[ep]
+                    window_ok = (not WINDOW_KIB or
+                                 (e["out_idx"] + 1) * MPS
+                                 - len(e["rx_bytes"])
+                                 <= WINDOW_KIB * 1024)
+                    if (not e["out_wait_ack"]
+                            and e["out_idx"] < len(packets[ep])
+                            and window_ok
+                            and not out_dp_queued(ep)
+                            and len(hp_queue) < 1 + NUM_EPS):
+                        send_next_out(ep, cycle)
+                    # keep the IN pipe polled; with WINDOW_KIB the reader
+                    # only starts once the initial window has been written
+                    # -- or once the writer is flow-controlled (a concurrent
+                    # reader, as in bandwidth_test.py or cdc-acm, is always
+                    # running; only the single-threaded window_test.py truly
+                    # serializes, and that case is covered on hardware by
+                    # the deep loopback FIFO).
+                    reads_started = (not WINDOW_KIB or
+                                     e["out_idx"] * MPS >= WINDOW_KIB * 1024
+                                     or e["out_nrdy"]
+                                     or e["out_idx"] >= len(packets[ep]))
+                    if (reads_started
+                            and not e["in_parked"] and not e["in_token"]
+                            and len(e["rx_bytes"]) < TOTAL_BYTES):
+                        grant_in_token(ep)
 
                 if not rx_words and rx_gap == 0:
                     refill_rx()
@@ -1076,21 +1324,27 @@ def main():
                 ctx.set(phy.raw_source.valid, 0)
 
             # ── completion / watchdogs ────────────────────────────────
-            if len(st["rx_bytes"]) >= TOTAL_BYTES and st["out_idx"] >= len(packets):
+            if all(len(eps[ep]["rx_bytes"]) >= TOTAL_BYTES
+                   and eps[ep]["out_idx"] >= len(packets[ep])
+                   for ep in EPS):
                 st["done"] = True
-                mbps = TOTAL_BYTES / (cycle * 8e-9) / 1e6
-                print(f"echoed {len(st['rx_bytes'])} bytes in {cycle} cycles "
-                      f"({mbps:.1f} MB/s at the link layer)")
+                total = TOTAL_BYTES * NUM_EPS
+                mbps = total / (cycle * 8e-9) / 1e6
+                print(f"echoed {total} bytes across {NUM_EPS} endpoint "
+                      f"pair(s) in {cycle} cycles "
+                      f"({mbps:.1f} MB/s aggregate at the link layer)")
                 print(f"stats: {_state_summary()}")
-                if bytes(st["rx_bytes"]) != payload:
-                    fail("final echo comparison mismatch")
+                for ep in EPS:
+                    if bytes(eps[ep]["rx_bytes"]) != payloads[ep]:
+                        fail(f"final echo comparison mismatch on ep{ep}")
                 print("LINK LOOPBACK SIM PASS")
                 return
 
             if cycle - st["progress_cycle"] > 80_000:
-                fail(f"cycle {cycle}: DEADLOCK (no progress for 80k cycles)")
+                fail(f"cycle {cycle}: DEADLOCK (no progress for 80k cycles)",
+                     ctx)
             if cycle > 3_000_000:
-                fail("global cycle limit exceeded")
+                fail("global cycle limit exceeded", ctx)
 
     sim.add_testbench(host)
     if os.environ.get("WRITE_VCD"):

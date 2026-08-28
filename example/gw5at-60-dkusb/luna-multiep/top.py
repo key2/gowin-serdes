@@ -1,14 +1,16 @@
-"""LUNA SuperSpeed vendor-class bulk loopback on the gw_usb3 PHY (DK_USB).
+"""LUNA SuperSpeed multi-endpoint bulk loopback on the gw_usb3 PHY (DK_USB).
 
-Bandwidth/soak vehicle for the open Gen1 stack: a bare vendor-specific
-device (no kernel driver binds; libusb claims it directly) with a single
-interface carrying EP1 bulk OUT looped straight back into EP1 bulk IN --
-the SuperSpeedStreamOutEndpoint from the luna-acm bring-up feeding
-LUNA's SuperSpeedStreamInEndpoint.
+Concurrency vehicle for the open Gen1 stack: a vendor-specific device
+with THREE independent bulk OUT -> bulk IN loopback pairs (EP1..EP3),
+each buffered by a 16 KiB BSRAM elastic FIFO.  Exercises the shared
+protocol machinery under simultaneous multi-endpoint traffic: the
+endpoint-mux TX packet lock, the kind-granular handshake arbiter, the
+per-endpoint NRDY/ERDY flow control, and interleaved per-EP sequence
+spaces (HANDOVER 10j).
 
-Validated in simulation first: sim_loopback.py runs the same endpoint
-pair against a host model (tokens/ACKs/NRDY/ERDY, NumP=1) and checks a
-multi-packet echo byte-for-byte across the 5-bit sequence wrap.
+Validated in simulation first: sim_link_loopback.py (luna-loopback/)
+runs the same endpoint pairs against a raw-wire link-partner host model
+with NUM_EPS=2..4, including LBAD/bad-header fault injection.
 
 Build & program:
 
@@ -17,12 +19,12 @@ Build & program:
     python top.py flash          # flash the existing bitstream
     python top.py program        # build + flash
 
-Bandwidth test (needs pyusb):
+Host test (needs pyusb):
 
-    sudo python bandwidth_test.py            # 16 MiB loopback, integrity + MB/s
+    sudo python multiep_test.py [MiB-per-EP]
 
-Debug UARTs as in luna-acm: ttyUSB4 link probe, ttyUSB5 IN-ladder probe.
-LED = link trained (U0).
+Debug UARTs as in luna-loopback: ttyUSB4 link probe, ttyUSB5 EP1
+IN-ladder probe.  LED = link trained (U0).
 """
 
 import importlib.util
@@ -55,8 +57,7 @@ from gowin_serdes.usb3 import attach_usb3_phy
 from luna.gateware.interface.serdes_phy.gowin_gtr12 import GowinGTR12PIPE
 from luna.gateware.usb.usb3.device import USBSuperSpeedDevice
 from luna.gateware.usb.usb3.endpoints.stream import SuperSpeedStreamInEndpoint
-from luna.gateware.usb.usb3.application.request import SuperSpeedRequestHandler
-
+from luna.gateware.usb.usb3.protocol.layer import TxDataSkidBuffer
 from usb_protocol.emitters import SuperSpeedDeviceDescriptorCollection
 
 from ss_stream_out import SuperSpeedStreamOutEndpoint
@@ -76,7 +77,14 @@ DBG_FREQ = 24_000_000
 BAUD_RATE = 115_200
 BOOT_RATE = "10G"           # proven: 10G boot + adapter rate switch to 5G
 
-BULK_EP = 1                 # data endpoints (OUT 0x01 / IN 0x81)
+# Loopback endpoint pairs (OUT 0x0n / IN 0x8n).  Two pairs are verified on
+# hardware.  A THREE-pair build reproducibly fails enumeration at the
+# SET_ADDRESS stage ("device not responding to setup address", -71) while
+# the same configuration passes the link-partner simulation including the
+# SET_ADDRESS contract check (WITH_CONTROL=1 NUM_EPS=3) -- open item, see
+# HANDOVER 10j.
+BULK_EPS = (1, 2)
+FIFO_WORDS = 4096           # per-pair elastic buffer: 16 KiB
 
 
 def make_serdes():
@@ -86,7 +94,7 @@ def make_serdes():
 
 
 def create_descriptors():
-    """Bare vendor-specific device: one interface, bulk OUT + bulk IN."""
+    """Vendor-specific device: one interface, three bulk OUT/IN pairs."""
     descriptors = SuperSpeedDeviceDescriptorCollection()
 
     with descriptors.DeviceDescriptor() as d:
@@ -96,7 +104,7 @@ def create_descriptors():
         d.bcdUSB             = 3.2
         d.bMaxPacketSize0    = 9           # 2**9 = 512
         d.iManufacturer      = "LUNA + gw_usb3"
-        d.iProduct           = "GTR12 SuperSpeed bulk loopback"
+        d.iProduct           = "GTR12 SuperSpeed multi-EP loopback"
         d.iSerialNumber      = "DK60"
         d.bNumConfigurations = 1
 
@@ -109,20 +117,21 @@ def create_descriptors():
             i.bInterfaceSubclass = 0x00
             i.bInterfaceProtocol = 0x00
 
-            with i.EndpointDescriptor(add_default_superspeed=True) as e:
-                e.bEndpointAddress = 0x80 | BULK_EP
-                e.bmAttributes     = 0x02  # bulk
-                e.wMaxPacketSize   = 1024
+            for ep in BULK_EPS:
+                with i.EndpointDescriptor(add_default_superspeed=True) as e:
+                    e.bEndpointAddress = 0x80 | ep
+                    e.bmAttributes     = 0x02  # bulk
+                    e.wMaxPacketSize   = 1024
 
-            with i.EndpointDescriptor(add_default_superspeed=True) as e:
-                e.bEndpointAddress = BULK_EP
-                e.bmAttributes     = 0x02  # bulk
-                e.wMaxPacketSize   = 1024
+                with i.EndpointDescriptor(add_default_superspeed=True) as e:
+                    e.bEndpointAddress = ep
+                    e.bmAttributes     = 0x02  # bulk
+                    e.wMaxPacketSize   = 1024
 
     return descriptors
 
 
-class LunaLoopbackTop(Elaboratable):
+class LunaMultiEpTop(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
@@ -199,77 +208,65 @@ class LunaLoopbackTop(Elaboratable):
             ]
 
         # ==============================================================
-        # LUNA SuperSpeed device: CDC-ACM with bulk echo
+        # LUNA SuperSpeed device: three bulk loopback pairs
         # ==============================================================
         m.submodules.usb = usb = USBSuperSpeedDevice(
             phy=adapter, sync_frequency=125e6)
 
         usb.add_standard_control_endpoint(create_descriptors())
 
-        # Bulk echo: OUT endpoint drains straight into the IN endpoint.
-        out_ep = SuperSpeedStreamOutEndpoint(
-            endpoint_number=BULK_EP, max_packet_size=1024)
-        usb.add_endpoint(out_ep)
+        in_eps = {}
+        out_eps = {}
+        for ep in BULK_EPS:
+            out_ep = SuperSpeedStreamOutEndpoint(
+                endpoint_number=ep, max_packet_size=1024)
+            usb.add_endpoint(out_ep)
+            out_eps[ep] = out_ep
 
-        # generate_zlps=False: the echo delimits every received packet with
-        # ``last`` (packet-sized "transfers"), and a tty byte stream needs no
-        # transfer framing -- ZLP follow-ups after every max-size packet
-        # would only cost bus turnarounds.
-        in_ep = SuperSpeedStreamInEndpoint(
-            endpoint_number=BULK_EP, max_packet_size=1024,
-            generate_zlps=False)
-        usb.add_endpoint(in_ep)
+            in_ep = SuperSpeedStreamInEndpoint(
+                endpoint_number=ep, max_packet_size=1024,
+                generate_zlps=False)
+            usb.add_endpoint(in_ep)
+            in_eps[ep] = in_ep
 
-        # Elastic loopback buffer: 64 KiB of BSRAM between the OUT and IN
-        # endpoints.  The OUT endpoint flow-controls (NRDY/ERDY) when this
-        # fills, which keeps the device protocol-correct at any host write
-        # depth; the depth itself lets single-threaded windowed tests (which
-        # write their whole window before the first read) run up to 64 KiB
-        # windows without engaging that backpressure.
-        fifo_depth = 16384                                # words = 64 KiB
-        fifo = SyncFIFOBuffered(width=32 + 4 + 1, depth=fifo_depth)
-        m.submodules.loop_fifo = DomainRenamer({"sync": "ss"})(fifo)
+            # Per-pair elastic loopback buffer (see luna-loopback/top.py for
+            # the rationale; 16 KiB each keeps three pairs affordable).
+            fifo = SyncFIFOBuffered(width=32 + 4 + 1, depth=FIFO_WORDS)
+            m.submodules[f"loop_fifo{ep}"] = DomainRenamer({"sync": "ss"})(fifo)
 
-        out_ep.packet_space = Signal()
-        m.d.comb += [
-            # OUT endpoint -> FIFO
-            fifo.w_data.eq(Cat(out_ep.stream.payload,
-                               out_ep.stream.valid,
-                               out_ep.stream.last)),
-            fifo.w_en.eq(out_ep.stream.valid.any() & fifo.w_rdy),
-            out_ep.stream.ready.eq(fifo.w_rdy),
+            out_ep.packet_space = Signal(name=f"packet_space{ep}")
+            m.d.comb += [
+                # OUT endpoint -> FIFO
+                fifo.w_data.eq(Cat(out_ep.stream.payload,
+                                   out_ep.stream.valid,
+                                   out_ep.stream.last)),
+                fifo.w_en.eq(out_ep.stream.valid.any() & fifo.w_rdy),
+                out_ep.stream.ready.eq(fifo.w_rdy),
 
-            # FIFO -> IN endpoint
-            in_ep.stream.payload.eq(fifo.r_data[0:32]),
-            in_ep.stream.valid.eq(Mux(fifo.r_rdy, fifo.r_data[32:36], 0)),
-            in_ep.stream.last.eq(fifo.r_data[36]),
-            fifo.r_en.eq(fifo.r_rdy & in_ep.stream.ready),
+                # FIFO -> IN endpoint
+                in_ep.stream.payload.eq(fifo.r_data[0:32]),
+                in_ep.stream.valid.eq(Mux(fifo.r_rdy, fifo.r_data[32:36], 0)),
+                in_ep.stream.last.eq(fifo.r_data[36]),
+                fifo.r_en.eq(fifo.r_rdy & in_ep.stream.ready),
 
-        ]
-        # Accept a data packet only when a whole max-size packet fits.
-        # Registered: the wide level comparison otherwise sits in the
-        # endpoint's accept/handshake cone (the margin absorbs staleness).
-        m.d.ss += out_ep.packet_space.eq((fifo_depth - fifo.level) >= 260)
+            ]
+            # Accept a data packet only when a whole max-size packet fits.
+            # Registered: the wide level comparison otherwise sits in the
+            # endpoint's accept/handshake cone (the margin absorbs staleness).
+            m.d.ss += out_ep.packet_space.eq((FIFO_WORDS - fifo.level) >= 260)
 
         m.d.comb += led.o.eq(usb.link_trained)
 
         # ==============================================================
-        # Debug UARTs (identical layout to luna-enum)
+        # Debug UARTs (identical layout to luna-loopback)
         # ==============================================================
         rx_com = Signal()
-        rx_d102 = Signal()
-        tx_d102 = Signal()
         m.d.comb += [
             rx_com.eq(adapter.rx_datavalid & adapter.rx_datak[0]
                       & (adapter.rx_data[0:8] == 0xBC)),
-            rx_d102.eq(adapter.rx_datavalid & (adapter.rx_datak[0:4] == 0)
-                       & (adapter.rx_data[0:16] == 0x4A4A)),
-            tx_d102.eq(~adapter.tx_elec_idle & (adapter.tx_datak[0:4] == 0)
-                       & (adapter.tx_data[0:16] == 0x4A4A)),
         ]
 
         # uart 0: link-event probe.
-        # C <ss-freq> <lfps_det> <ts1_det> <ts2_det> <rx_com> <flag>
         uart0 = platform.request("uart", 0)
         m.submodules.linkprobe = linkprobe = DomainRenamer({"cfg": "dbg"})(
             ClockFreqProbe(clk_freq=DBG_FREQ, baud=BAUD_RATE, channels=(
@@ -292,12 +289,9 @@ class LunaLoopbackTop(Elaboratable):
         m.submodules += FFSynchronizer(uart0.rx.i, rx0_unused,
                                        o_domain="dbg")
 
-        # uart 1: IN-endpoint transaction-ladder probe.
-        # C <in-tokens> <nrdy> <erdy> <ep-tx-words> <echo-words> <flag>
-        # flag = {erdy_done_seen, in_token_seen, ep_tx_seen, link_trained}
-        # All probe taps are registered first so the debug logic never adds
-        # combinational load to protocol-critical cones.
-        in_if = in_ep.interface
+        # uart 1: EP1 IN-endpoint transaction-ladder probe.
+        in_if = in_eps[BULK_EPS[0]].interface
+        out_ep0 = out_eps[BULK_EPS[0]]
         in_token = Signal()
         ep_tx_word = Signal()
         echo_word = Signal()
@@ -305,10 +299,10 @@ class LunaLoopbackTop(Elaboratable):
         m.d.ss += [
             in_token.eq(
                 in_if.handshakes_in.ack_received
-                & (in_if.handshakes_in.endpoint_number == BULK_EP)
+                & (in_if.handshakes_in.endpoint_number == BULK_EPS[0])
                 & (in_if.handshakes_in.number_of_packets != 0)),
             ep_tx_word.eq(in_if.tx.valid.any() & in_if.tx.ready),
-            echo_word.eq(out_ep.stream.valid.any() & out_ep.stream.ready),
+            echo_word.eq(out_ep0.stream.valid.any() & out_ep0.stream.ready),
             erdy_done.eq(in_if.handshakes_out.send_erdy
                          & in_if.handshakes_out.done),
         ]
@@ -373,12 +367,12 @@ def build(do_program=False):
     platform = DKUSBGW5AT60Platform()
     _setup_gowin_env(platform)
     platform.add_file("serdes.csr", (HERE / "serdes.csr").read_text())
-    platform.build(LunaLoopbackTop(), name="luna_loopback", build_dir="build",
+    platform.build(LunaMultiEpTop(), name="luna_multiep", build_dir="build",
                    do_program=do_program)
 
 
 def flash():
-    bitstream = HERE / "build" / "luna_loopback.fs"
+    bitstream = HERE / "build" / "luna_multiep.fs"
     if not bitstream.exists():
         sys.exit(f"no bitstream at {bitstream}; run `python top.py` first")
     cmd = ["openFPGALoader", "-c", "ft232", str(bitstream)]

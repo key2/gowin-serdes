@@ -71,6 +71,7 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
         self.debug_fill  = Signal(range(max_packet_size // 4 + 1))
         self.debug_total = Signal(range(max_packet_size // 4 + 1))
         self.debug_pos   = Signal(range(max_packet_size // 4 + 1))
+        self.debug_fsm   = Signal(3)
 
     def elaborate(self, platform):
         m = Module()
@@ -150,7 +151,7 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
             with m.Else():
                 m.d.ss   += fill_count.eq(fill_count + 1)
 
-        with m.FSM(domain="ss"):
+        with m.FSM(domain="ss") as rx_fsm:
 
             # IDLE -- adjudicate completed packets on the CRC strobes
             # (payload capture runs continuously outside the FSM).
@@ -273,6 +274,11 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
                 m.d.comb += handshakes_out.send_erdy.eq(1)
                 with m.If(handshakes_out.done):
                     m.next = "IDLE"
+
+        for _i, _name in enumerate(("IDLE", "DRAIN", "ACK", "AWAIT_SPACE",
+                                    "SEND_ERDY")):
+            with m.If(rx_fsm.ongoing(_name)):
+                m.d.comb += self.debug_fsm.eq(_i)
 
         # Endpoint reset (SET_CONFIGURATION): back to sequence zero.
         # This is outside the FSM so it wins over any in-flight state.
