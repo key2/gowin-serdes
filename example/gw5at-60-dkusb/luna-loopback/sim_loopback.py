@@ -172,6 +172,14 @@ def main():
             # collect tx words
             lanes = ctx.get(shared.tx.valid)
             if lanes:
+                # First word of a packet: emulate the shared data-packet
+                # transmitter latching the captured tx parameters
+                # (DataPacketTransmitter.parameters_consumed, plumbed
+                # back as tx_parameters_consumed); the mux holds its
+                # parameter registers -- and defers the next grant --
+                # until this fires (bug #25 fix).
+                ctx.set(shared.tx_parameters_consumed,
+                        1 if not word_buf else 0)
                 word = ctx.get(shared.tx.payload)
                 nbytes = bin(lanes).count("1")
                 word_buf += word.to_bytes(4, "little")[:nbytes]
@@ -180,6 +188,8 @@ def main():
                                       ctx.get(shared.tx_sequence_number),
                                       bytes(word_buf)))
                     word_buf.clear()
+            else:
+                ctx.set(shared.tx_parameters_consumed, 0)
 
     state = {
         "rx_bytes": bytearray(),

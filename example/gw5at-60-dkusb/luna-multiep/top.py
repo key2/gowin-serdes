@@ -30,6 +30,7 @@ IN-ladder probe.  LED = link trained (U0).
 import functools
 import importlib.util
 import operator
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -93,6 +94,17 @@ BOOT_RATE = "10G"           # proven: 10G boot + adapter rate switch to 5G
 BULK_EPS = (1, 2, 3)
 FIFO_WORDS = 4096           # per-pair elastic buffer: 16 KiB
 
+# Burst depth (packets in flight per pipe; descriptors advertise
+# bMaxBurst = max(BURST_IN, BURST_OUT) - 1).  1 elaborates the
+# historical single-packet engines -- the verified shipping default.
+# The burst engines are sim-green (see HANDOVER 10m) but FAILED their
+# first hardware rung (pipe wedge after the first 2-packet burst; wire
+# clean, retry_flagged=0): bring-up needs an ACK-TP field probe.  The
+# per-direction knobs are the discriminator for that session.
+BURST     = int(os.environ.get("MULTIEP_BURST", 1))
+BURST_IN  = int(os.environ.get("MULTIEP_BURST_IN", BURST))
+BURST_OUT = int(os.environ.get("MULTIEP_BURST_OUT", BURST))
+
 
 def make_serdes():
     return make_usb3_serdes(GowinDevice.GW5AT_60, QUAD, LANE,
@@ -125,15 +137,19 @@ def create_descriptors():
             i.bInterfaceProtocol = 0x00
 
             for ep in BULK_EPS:
-                with i.EndpointDescriptor(add_default_superspeed=True) as e:
+                with i.EndpointDescriptor() as e:
                     e.bEndpointAddress = 0x80 | ep
                     e.bmAttributes     = 0x02  # bulk
                     e.wMaxPacketSize   = 1024
+                    with e.SuperSpeedCompanion() as c:
+                        c.bMaxBurst = BURST_IN - 1
 
-                with i.EndpointDescriptor(add_default_superspeed=True) as e:
+                with i.EndpointDescriptor() as e:
                     e.bEndpointAddress = ep
                     e.bmAttributes     = 0x02  # bulk
                     e.wMaxPacketSize   = 1024
+                    with e.SuperSpeedCompanion() as c:
+                        c.bMaxBurst = BURST_OUT - 1
 
     return descriptors
 
@@ -160,7 +176,7 @@ class TxWireChecker(Elaboratable):
         self.enable = Signal()
 
         self.dp_seen  = {ep: Signal(name=f"dp_seen{ep}") for ep in eps}
-        self.dp_other = Signal()      # DP with an endpoint number not in eps
+        self.dp_other = Signal()      # DP from an endpoint not in eps (EP0 excluded)
         self.err      = Signal()      # framing/length violation strobe
         self.crc_err  = Signal()      # DPP CRC-32 mismatch (aligned DPs)
 
@@ -234,9 +250,16 @@ class TxWireChecker(Elaboratable):
                         with m.If(dp_ep == ep):
                             m.d.comb += self.dp_seen[ep].eq(1)
                     if self._eps:
+                        # EP0 is excluded: control-transfer IN data stages
+                        # are legitimate DPs from endpoint 0 (they fire
+                        # during every enumeration), and flagging them
+                        # made the sticky meaningless.  ``dp_other`` now
+                        # means "DP from an endpoint that cannot send
+                        # DPs" -- a real mux/parameter corruption.
                         with m.If(~functools.reduce(
                                 operator.or_,
-                                [dp_ep == ep for ep in self._eps])):
+                                [dp_ep == ep for ep in self._eps])
+                                  & (dp_ep != 0)):
                             m.d.comb += self.dp_other.eq(1)
 
                     with m.If((d == W_SDP) & (c == K1111)):
@@ -349,7 +372,7 @@ class LunaMultiEpTop(Elaboratable):
             # content change reshuffles the deterministic PnR placement --
             # the previous roll came in at pclk Fmax 123.6 < the 125 MHz
             # operating gate.)
-            por_n.eq(por_cnt > 66_002),
+            por_n.eq(por_cnt > 66_009),
             luna_go.eq(por_cnt.all()),
         ]
 
@@ -400,13 +423,13 @@ class LunaMultiEpTop(Elaboratable):
         out_eps = {}
         for ep in BULK_EPS:
             out_ep = SuperSpeedStreamOutEndpoint(
-                endpoint_number=ep, max_packet_size=1024)
+                endpoint_number=ep, max_packet_size=1024, max_burst=BURST_OUT)
             usb.add_endpoint(out_ep)
             out_eps[ep] = out_ep
 
             in_ep = SuperSpeedStreamInEndpoint(
                 endpoint_number=ep, max_packet_size=1024,
-                generate_zlps=False)
+                generate_zlps=False, max_burst=BURST_IN)
             usb.add_endpoint(in_ep)
             in_eps[ep] = in_ep
 

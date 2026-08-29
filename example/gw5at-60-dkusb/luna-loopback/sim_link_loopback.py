@@ -117,6 +117,41 @@ Env knobs:
                            token-strobe loss is invisible to it.  Late
                            and duplicate DPs crossing a retry are
                            tolerated like an xHC tolerates them.
+    RECOVERY_AT=n          host-initiated link recovery: n cycles after
+                           training (and addressing), the host retrains
+                           the link from U0 (TS1/TS2 exchange -- no LFPS
+                           from U0-recovery), then performs the Header
+                           Sequence Number Advertisement + Rx Header
+                           Buffer Credit Advertisement [USB3.2 7.2.4.1.x].
+                           The host retransmits its own unacknowledged
+                           headers (original sequence numbers, DL=1) and
+                           EXPECTS the device to do the same: header
+                           packets sent before Recovery whose sequence
+                           number is greater than the advertised one must
+                           be retransmitted, not flushed (7b-b -- LUNA
+                           upstream flushes everything, losing them).
+    RECOVERY_EVERY=n       repeat a recovery every n cycles for the whole
+                           run (mid-traffic retrains at every phase of
+                           the transmit pipeline)
+    NUMP=k                 IN-token grant size (bMaxBurst+1 as an xHC
+                           grants it; default 1 = the historical
+                           packet-per-token rhythm).  By default the
+                           host then acknowledges EVERY data packet with
+                           the sliding window in NumP, exactly like the
+                           bench xHC -- NumP counts buffers INCLUDING
+                           the device's packets still in flight past the
+                           acknowledged sequence number (the accounting
+                           that hardware-failed the first burst image).
+    COALESCE_ACKS=1        instead acknowledge only at burst boundaries
+                           -- one cumulative ACK per burst that both
+                           grants the next window and retires every
+                           packet of the previous one; asserts the
+                           device sets EOB on the final granted packet.
+    NUMP_SWEEP=1           randomize each grant in 1..NUMP
+    BURST=n                device-side burst depth for the IN endpoints
+                           (max packets in flight; the descriptor would
+                           advertise bMaxBurst = n-1).  Default 1 = the
+                           historical single-packet engine.
     TRACE_LO/TRACE_HI      cycle window: print every parsed TX word
     WRITE_VCD=1            dump /tmp/kilo/link_loopback.vcd
 """
@@ -183,6 +218,12 @@ LC_JITTER    = int(os.environ.get("LC_JITTER", 0))
 PIPE_PHASE   = int(os.environ.get("PIPE_PHASE", 0))
 REORDER      = int(os.environ.get("REORDER", 0))
 RETRY_TIMEOUT = int(os.environ.get("RETRY_TIMEOUT", 0))
+RECOVERY_AT  = int(os.environ.get("RECOVERY_AT", 0))
+RECOVERY_EVERY = int(os.environ.get("RECOVERY_EVERY", 0))
+NUMP         = int(os.environ.get("NUMP", 1))
+NUMP_SWEEP   = int(os.environ.get("NUMP_SWEEP", 0))
+COALESCE_ACKS = int(os.environ.get("COALESCE_ACKS", 0))
+BURST        = int(os.environ.get("BURST", 1))
 TRACE_LO     = int(os.environ.get("TRACE_LO", 0))
 TRACE_HI     = int(os.environ.get("TRACE_HI", 0))
 MPS          = 1024
@@ -457,9 +498,11 @@ class LinkBench(Elaboratable):
             self.control_ep.add_standard_request_handlers(
                 _control_descriptors())
         self.out_eps = {ep: SuperSpeedStreamOutEndpoint(
-            endpoint_number=ep, max_packet_size=MPS) for ep in EPS}
+            endpoint_number=ep, max_packet_size=MPS, max_burst=BURST)
+            for ep in EPS}
         self.in_eps = {ep: SuperSpeedStreamInEndpoint(
-            endpoint_number=ep, max_packet_size=MPS, generate_zlps=False)
+            endpoint_number=ep, max_packet_size=MPS, generate_zlps=False,
+            max_burst=BURST)
             for ep in EPS}
         # Real TX conditioning stages, exactly as in physical/layer.py --
         # INCLUDING the scrambler (paired with a real descrambler at the
@@ -502,6 +545,10 @@ class LinkBench(Elaboratable):
             proto_ep.tx_endpoint_number  .eq(shared.tx_endpoint_number),
             proto_ep.tx_sequence_number  .eq(shared.tx_sequence_number),
             proto_ep.tx_direction     .eq(shared.tx_direction),
+            proto_ep.tx_eob           .eq(shared.tx_eob),
+            shared.tx_parameters_consumed
+                                      .eq(proto_ep.tx_parameters_consumed),
+            shared.link_reset         .eq(~self.link.trained),
 
             proto_ep.handshakes_out   .connect(shared.handshakes_out),
             proto_ep.handshakes_in    .connect(shared.handshakes_in),
@@ -707,6 +754,7 @@ class DevTxParser:
                          f"dl={delayed}")
             self.dpp = {
                 "data_seq": dw1 & 0x1F,
+                "eob": (dw1 >> 6) & 1,
                 "direction": (dw1 >> 7) & 1,
                 "ep": (dw1 >> 8) & 0xF,
                 "length": (dw1 >> 16) & 0xFFFF,
@@ -776,7 +824,8 @@ class DevTxParser:
                                f"[DP seq {d['data_seq']} len {d['length']}]")
             info = dict(d["info"])
             info.update(data_seq=d["data_seq"], ep=d["ep"],
-                        direction=d["direction"], payload=bytes(d["payload"]))
+                        direction=d["direction"], eob=d["eob"],
+                        payload=bytes(d["payload"]))
             self.dispatch("dp", info, self.cycle)
             self.dpp = None
             self.state = "IDLE"
@@ -827,9 +876,16 @@ def main():
 
     # Per-endpoint-pair protocol state.
     eps = {ep: {
-        "out_idx": 0, "out_seq": 0, "out_wait_ack": False,
+        # OUT pipe: window accounting, driven by the device's advertised
+        # NumP (a burst-less device advertises 1 -> the historical
+        # send-one-wait-ack rhythm).  ``out_idx``/``out_seq`` are the
+        # ACKNOWLEDGED boundary; ``out_inflight`` packets beyond it have
+        # been sent (or queued) and await acknowledgement.
+        "out_idx": 0, "out_seq": 0, "out_inflight": 0, "out_window": 1,
         "out_retry": 0, "out_nrdy": False, "out_retrans": 0,
         "in_seq": 0, "in_parked": False, "in_token": False,
+        "grant_left": 0,              # packets remaining on the IN grant
+        "reestablish": False,         # post-recovery retry token pending
         "rx_bytes": bytearray(),
         # xHC URB-rhythm modeling (URB_PACKETS).
         "in_urb_left":  URB_PACKETS,
@@ -855,6 +911,18 @@ def main():
     hp_queue = []      # list of frame dicts (unsent; credit-gated)
     hp_resend = []     # list of (seq, frame) to retransmit with DL=1
     unacked = []       # list of (seq, frame) sent, awaiting device LGOOD
+
+    # Scripted link recovery state (RECOVERY_AT / RECOVERY_EVERY).
+    rec = {
+        "phase": None,        # None | "TS1" | "TS2" | "IDLE"
+        "entered": False,     # device observed out of U0 this recovery
+        "count": 0,           # completed recoveries
+        "last": 0,            # cycle the last recovery completed
+        "trained_at": 0,      # cycle of initial training
+        "adv_pending": False, # device re-advertisement expected
+        "host_adv": 0,        # LGOOD_n value we advertise on re-entry
+        "retry_eps": [],      # eps whose DPP was truncated by the retrain
+    }
 
     flow_last_ready = {}
 
@@ -903,7 +971,8 @@ def main():
     def _state_summary():
         per_ep = " ".join(
             f"ep{ep}[out={e['out_idx']}/{len(packets[ep])}"
-            f" wa={int(e['out_wait_ack'])} nrdy={int(e['out_nrdy'])}"
+            f" if={e['out_inflight']}/{e['out_window']}"
+            f" nrdy={int(e['out_nrdy'])}"
             f" iseq={e['in_seq']} park={int(e['in_parked'])}"
             f" tok={int(e['in_token'])} rx={len(e['rx_bytes'])}"
             f" rty={e['out_retry']} rtx={e['out_retrans']}]"
@@ -921,11 +990,16 @@ def main():
 
     # -- host protocol reactions -----------------------------------------
 
-    def grant_in_token(ep, nump=1, retry=0, earliest=None):
+    def grant_in_token(ep, nump=None, retry=0, earliest=None):
         e = eps[ep]
+        if nump is None:
+            # Burst grant: NumP as an xHC would grant it (up to
+            # bMaxBurst+1), optionally swept per token.
+            nump = rng.randint(1, NUMP) if NUMP_SWEEP else NUMP
         hp_push(frame_ack_tp(ep=ep, nseq=e["in_seq"],
                              nump=nump, retry=retry, direction=1),
                 ("in", ep), earliest=earliest)
+        e["grant_left"] = nump
         if nump:
             e["in_token"] = True
 
@@ -934,20 +1008,21 @@ def main():
         st["host_hdr_seq"] = (seq + 1) & 0x7
         return seq
 
-    def out_dp_queued(ep):
-        """Is a copy of this endpoint's OUT DP already queued for (re)send?"""
-        tag = f"DP(ep={ep},"
-        return any(f["kind"].startswith(tag) for f in hp_queue) or \
-            any(f["kind"].startswith(tag) for _s, f in hp_resend)
+    def purge_out(ep):
+        """Drop unsent queued OUT DPs for this pipe (their baked-in
+        sequence numbers are stale after a device-requested rewind)."""
+        hp_queue[:] = [f for f in hp_queue if f.get("flow") != ("out", ep)]
 
     def send_next_out(ep, cycle):
         e = eps[ep]
-        idx = e["out_idx"]
+        idx  = e["out_idx"] + e["out_inflight"]
+        dseq = (e["out_seq"] + e["out_inflight"]) & 0x1F
         data = packets[ep][idx]
-        hp_push(frame_out_dp(ep, e["out_seq"], data), ("out", ep))
-        e["out_wait_ack"] = True
-        log.add(cycle, "host-OUT", f"ep={ep} idx={idx} dseq={e['out_seq']} "
-                                   f"len={len(data)}")
+        hp_push(frame_out_dp(ep, dseq, data), ("out", ep))
+        e["out_inflight"] += 1
+        log.add(cycle, "host-OUT", f"ep={ep} idx={idx} dseq={dseq} "
+                                   f"len={len(data)} "
+                                   f"if={e['out_inflight']}/{e['out_window']}")
 
     def _lbad_this_header(info, cycle):
         """Fault injection: reject a (structurally fine) device header with
@@ -974,7 +1049,36 @@ def main():
             st["lc_counts"][name] = st["lc_counts"].get(name, 0) + 1
             log.add(cycle, "dev-lc", f"{name}_{sub}")
             if cmd == LC_LGOOD:
-                if not st["dev_adv_seen"]:
+                if not st["dev_adv_seen"] and rec["adv_pending"]:
+                    # Post-recovery Header Sequence Number Advertisement:
+                    # LGOOD_n acknowledges every host header up to and
+                    # including sequence number n [USB3.2 7.2.4.1.x rule
+                    # 7b]; the remainder must be retransmitted with their
+                    # original sequence numbers (DL=1).  The device's own
+                    # TX sequence continues where it left off, so the
+                    # parser's expectation is NOT reset.
+                    st["dev_adv_seen"] = True
+                    rec["adv_pending"] = False
+                    resume = (sub + 1) & 0x7
+                    acked = 0
+                    while unacked and unacked[0][0] != resume:
+                        unacked.pop(0)
+                        acked += 1
+                    st["dev_lgood_next"] = resume
+                    del hp_resend[:]
+                    if unacked:
+                        hp_resend.extend(unacked)
+                    # Unlike LBAD-flow resends (whose original credit is
+                    # still held), post-recovery retransmissions occupy
+                    # FRESH rx buffers: the credit pool restarted at the
+                    # advertisement, so each resend consumes one credit
+                    # [USB3.2 7.2.4.1.x rule 5].
+                    rec["credit_resends"] = len(unacked)
+                    log.add(cycle, "REC-adv",
+                            f"device LGOOD_{sub}: {acked} retired, "
+                            f"{len(unacked)} to resend "
+                            f"{[s for s, _ in unacked]}")
+                elif not st["dev_adv_seen"]:
                     if sub != 7:
                         fail(f"device advertisement LGOOD_{sub}, expected 7")
                     st["dev_adv_seen"] = True
@@ -1105,38 +1209,42 @@ def main():
             st["acks"] += 1
             log.add(cycle, "dev-ACK",
                     f"ep={ep} nseq={nseq} rty={retry} nump={nump}")
-            # Sequence-driven, like an xHC: the advertised next-expected
-            # sequence decides; a retry bit or repeated sequence asks for a
-            # (re)transmission of the current packet.  Duplicate responses
-            # (possible when link-level retries overlap protocol retries)
-            # are ignored.
-            if nseq == ((e["out_seq"] + 1) & 0x1F):
-                if e["out_wait_ack"]:
-                    e["out_seq"] = nseq
-                    e["out_idx"] += 1
-                    e["out_wait_ack"] = False
-                    st["progress_cycle"] = cycle
-                    # URB rhythm: the writer's next 16 KiB URB reaches the
-                    # xHC only after a resubmission gap.
-                    if URB_PACKETS:
-                        e["out_urb_left"] -= 1
-                        if e["out_urb_left"] <= 0:
-                            e["out_urb_left"] = URB_PACKETS
-                            e["out_resume_at"] = cycle + URB_GAP + \
-                                (rng.randint(0, URB_JITTER) if URB_JITTER
-                                 else 0)
-                # else: duplicate ACK of an already-completed packet.
-            elif nseq == e["out_seq"]:
-                # Device expects the current packet (again).
-                if e["out_wait_ack"]:
-                    e["out_retry"] += 1
-                    log.add(cycle, "host-retry",
-                            f"ep={ep} dseq={e['out_seq']}")
-                    e["out_wait_ack"] = False
-                # else: a (re)send is already queued; nothing to do.
+            # Window accounting, like an xHC: the acknowledgement's
+            # sequence number cumulatively retires every in-flight packet
+            # before it; its NumP is the device's current receive window.
+            # A retry bit rewinds transmission to the acknowledged point.
+            # Events whose sequence lies outside the in-flight span are
+            # stale (link-level DL replays) and are ignored.
+            adv = (nseq - e["out_seq"]) & 0x1F
+            if adv > e["out_inflight"]:
+                log.add(cycle, "host-note",
+                        f"stale OUT ACK ep={ep} nseq={nseq} ignored")
+            elif retry:
+                # Retire the acknowledged prefix, rewind the rest.
+                e["out_idx"] += adv
+                e["out_seq"] = nseq
+                e["out_inflight"] = 0
+                e["out_window"] = max(nump, 1)
+                purge_out(ep)
+                e["out_retry"] += 1
+                st["progress_cycle"] = cycle
+                log.add(cycle, "host-retry", f"ep={ep} resume dseq={nseq}")
             else:
-                fail(f"device ACK ep={ep} with unexpected nseq {nseq} "
-                     f"(out_seq={e['out_seq']})")
+                e["out_idx"] += adv
+                e["out_seq"] = nseq
+                e["out_inflight"] -= adv
+                e["out_window"] = nump
+                if adv:
+                    st["progress_cycle"] = cycle
+                # URB rhythm: the writer's next 16 KiB URB reaches the
+                # xHC only after a resubmission gap.
+                if URB_PACKETS and adv:
+                    e["out_urb_left"] -= adv
+                    if e["out_urb_left"] <= 0:
+                        e["out_urb_left"] = URB_PACKETS
+                        e["out_resume_at"] = cycle + URB_GAP + \
+                            (rng.randint(0, URB_JITTER) if URB_JITTER
+                             else 0)
         elif subtype == TP_NRDY:
             st["nrdy"] += 1
             log.add(cycle, "dev-NRDY", f"ep={ep} dir={direction}")
@@ -1145,14 +1253,16 @@ def main():
                 e["in_parked"] = True
                 e["in_token"] = False
             else:
-                # OUT pipe: the device discarded our unacknowledged DP;
-                # hold it for retransmission after ERDY.  With link-level
+                # OUT pipe: the device discarded unacknowledged DP(s);
+                # hold them for retransmission after ERDY.  With link-level
                 # retries in play this can also be the response to our own
                 # DL-replay of an already-acknowledged DP -- stale, and
                 # ignorable like an xHC ignores responses for completed
                 # transfers (the next DP just gets flow-controlled again).
-                if e["out_wait_ack"]:
+                if e["out_inflight"]:
                     e["out_nrdy"] = True
+                    e["out_inflight"] = 0
+                    purge_out(ep)
                 else:
                     log.add(cycle, "host-note",
                             f"stale OUT NRDY ep={ep} ignored")
@@ -1162,12 +1272,16 @@ def main():
             if direction == 1:
                 e["in_parked"] = False
             else:
-                # OUT pipe reopened: retransmit the NRDY'd packet.
+                # OUT pipe reopened: the main loop resumes sending from
+                # the acknowledged boundary.  The ERDY's NumP is the
+                # device's current window.  This must ALSO reopen a
+                # window closed by an ACK carrying NumP=0 (ring
+                # momentarily full) -- not only an NRDY park.
                 if e["out_nrdy"]:
-                    e["out_nrdy"] = False
                     e["out_retrans"] += 1
-                    e["out_wait_ack"] = False   # main loop re-sends out_idx
-                    st["progress_cycle"] = cycle
+                e["out_nrdy"] = False
+                e["out_window"] = max(nump, 1)
+                st["progress_cycle"] = cycle
         else:
             fail(f"unexpected TP subtype {subtype}")
 
@@ -1191,9 +1305,29 @@ def main():
             if not any(f.get("flow") == ("in", ep) for f in hp_queue):
                 grant_in_token(ep)
             return
+        behind = (e["in_seq"] - dseq) & 0x1F
+        if dseq != e["in_seq"] and 0 < behind <= 8:
+            # Duplicate of an already-received packet: overlapping tokens
+            # (a link-level redelivery of an old token racing a newer or
+            # re-establishing one) make the device legitimately re-answer
+            # with a resend.  An xHC discards duplicates silently; the
+            # newest token's answer arrives in order behind it.
+            log.add(cycle, "host-dup", f"ep={ep} dseq={dseq} "
+                                       f"(expect {e['in_seq']}) ignored")
+            return
+        if dseq != e["in_seq"] and e["reestablish"]:
+            # Stale packet from the pipe's pre-recovery grant era: packets
+            # already committed to the shared transmit pipeline when the
+            # link dropped go out ahead of our re-establishing retry
+            # token.  An xHC discards them; the retry token's rewind
+            # delivers them again in order.
+            log.add(cycle, "host-stale-dp", f"ep={ep} dseq={dseq} "
+                                            f"(expect {e['in_seq']}) ignored")
+            return
         if dseq != e["in_seq"]:
             fail(f"device DP ep={ep} sequence {dseq}, "
                  f"expected {e['in_seq']}")
+        e["reestablish"] = False
         pos = len(e["rx_bytes"])
         expect = payloads[ep][pos:pos + len(info["payload"])]
         if info["payload"] != expect:
@@ -1215,10 +1349,48 @@ def main():
                  f"expected {expect[i]:02x}; delivered bytes are {origin}")
         e["rx_bytes"].extend(info["payload"])
         e["in_seq"] = (e["in_seq"] + 1) & 0x1F
-        e["in_token"] = False
-        e["tok_sent_at"] = None
         e["tok_retries"] = 0
         st["progress_cycle"] = cycle
+        if e["grant_left"] > 0:
+            e["grant_left"] -= 1
+
+        # xHC-faithful default for burst grants: acknowledge EVERY data
+        # packet, with the sliding window in NumP (the bench xHC does
+        # exactly this; NumP counts buffers INCLUDING the device's
+        # packets still in flight past our sequence number -- the
+        # accounting the coalesced mode structurally cannot exercise).
+        if NUMP > 1 and not COALESCE_ACKS:
+            if URB_PACKETS:
+                e["in_urb_left"] -= 1
+                if e["in_urb_left"] <= 0 and len(e["rx_bytes"]) < TOTAL_BYTES:
+                    e["in_urb_left"] = URB_PACKETS
+                    grant_in_token(ep, nump=0)
+                    resume = cycle + URB_GAP + \
+                        (rng.randint(0, URB_JITTER) if URB_JITTER else 0)
+                    e["in_resume_at"] = resume
+                    grant_in_token(ep, earliest=resume)
+                    return
+            grant_in_token(ep)
+            return
+
+        # Mid-burst (coalesced-acknowledgement mode): the grant still has
+        # packets and the device did not close the burst -- keep
+        # receiving without acknowledging (the burst-boundary ACK below
+        # is cumulative).  The response timer is re-armed per received
+        # packet.
+        if e["grant_left"] > 0 and not info.get("eob"):
+            e["tok_sent_at"] = cycle if RETRY_TIMEOUT else None
+            return
+
+        # Burst boundary (grant exhausted, or the device set EOB).  A
+        # burst-aware device must have flagged its final granted packet:
+        # missing EOB leaves a real xHC waiting on an open burst.
+        if NUMP > 1 and COALESCE_ACKS and e["grant_left"] == 0 \
+                and not info.get("eob"):
+            fail(f"device ep{ep} exhausted a NumP grant without setting "
+                 f"EOB on the final packet (dseq {dseq})")
+        e["in_token"] = False
+        e["tok_sent_at"] = None
         if URB_PACKETS:
             e["in_urb_left"] -= 1
             if e["in_urb_left"] <= 0 and len(e["rx_bytes"]) < TOTAL_BYTES:
@@ -1233,7 +1405,8 @@ def main():
                 e["in_resume_at"] = resume
                 grant_in_token(ep, earliest=resume)
                 return
-        # ACK doubles as the next IN token, like an xHC.
+        # ACK doubles as the next IN token, like an xHC: its sequence
+        # number cumulatively retires every packet of the burst.
         grant_in_token(ep)
 
     parser = DevTxParser(log, dispatch)
@@ -1269,8 +1442,16 @@ def main():
                     log.add(cycle, "host-lc-burst", f"{len(burst)} words")
                     return
             if hp_resend:
-                # Link-level retransmission after a device LBAD: original
-                # sequence numbers, DL=1, no fresh credit consumed.
+                # Link-level retransmission: original sequence numbers,
+                # DL=1.  After a device LBAD no fresh credit is consumed
+                # (the partner still holds the buffers); after a recovery
+                # the credit pool restarted, so the advertisement-driven
+                # resends each consume one fresh credit and wait for it.
+                if rec.get("credit_resends", 0) > 0:
+                    if st["host_tx_credits"] <= 0:
+                        return
+                    st["host_tx_credits"] -= 1
+                    rec["credit_resends"] -= 1
                 seq, frame = hp_resend.pop(0)
                 log.add(cycle, "host-resend", f"seq={seq} {frame['kind']}")
                 rx_words = frame_to_words(frame, seq, delayed=1)
@@ -1322,7 +1503,7 @@ def main():
 
             # ── consume device TX (post skip-inserter) ────────────────
             trained = ctx.get(bench.link.trained)
-            if st["trained_seen"]:
+            if st["trained_seen"] and rec["phase"] is None:
                 st["skp_gap"] += 4
             v = ctx.get(ctc_src.valid)
             if v:
@@ -1339,7 +1520,8 @@ def main():
                         parser.feed(data, ctrl, cycle)
                     except SimViolation as e:
                         fail(str(e))
-            if st["trained_seen"] and not NO_SKP_CHECK:
+            if st["trained_seen"] and not NO_SKP_CHECK \
+                    and rec["phase"] is None:
                 if st["skp_gap"] > MAX_SKP_GAP:
                     fail(f"cycle {cycle}: SKP starvation: {st['skp_gap']} "
                          f"wire bytes without a SKP ordered set "
@@ -1440,10 +1622,67 @@ def main():
 
             # ── link training script ──────────────────────────────────
             if not trained:
-                if st["trained_seen"]:
+                if st["trained_seen"] and rec["phase"] is None:
                     fail(f"cycle {cycle}: link dropped out of U0 "
-                         f"(recovery triggered)")
-                if train_phase == "DETECT":
+                         f"(unscripted recovery)")
+                if rec["phase"] is not None:
+                    # ── scripted recovery: device out of U0 ───────────
+                    if not rec["entered"]:
+                        rec["entered"] = True
+                        # A rejected (LBADed, unresumed) header does not
+                        # count as received: rewind the parser expectation
+                        # to it, exactly as the never-to-arrive LRTY would
+                        # have -- the device retransmits it post-recovery.
+                        if parser.ignoring:
+                            parser.exp_hdr_seq = st["lbad_seq"]
+                        # Compute our Header Sequence Number Advertisement
+                        # NOW: LGOOD_n with n = last header we properly
+                        # received.
+                        rec["host_adv"] = (parser.exp_hdr_seq - 1) & 0x7
+                        # Every pipe whose token is already ON THE WIRE
+                        # with its burst incomplete must be re-established
+                        # after the retrain with a fresh retry token (the
+                        # device voids stale grants on link-down): that
+                        # covers both a DPH whose DPP the retrain
+                        # truncated (received and advertised, payload
+                        # lost) and grants the device had not yet fully
+                        # served.  Pipes whose next token is still QUEUED
+                        # are excluded -- that token goes out normally
+                        # after recovery and re-grants by itself; doubling
+                        # it with a retry would request a resend of data
+                        # the host already acknowledged.
+                        rec["retry_eps"] = [
+                            ep for ep in EPS
+                            if eps[ep]["in_token"]
+                            and not eps[ep]["in_parked"]
+                            and not any(f.get("flow") == ("in", ep)
+                                        for f in hp_queue)]
+                        if parser.dpp is not None and \
+                                parser.dpp["ep"] not in rec["retry_eps"]:
+                            rec["retry_eps"].append(parser.dpp["ep"])
+                        parser.enabled = False
+                        parser.state = "IDLE"
+                        parser.hdr = []
+                        parser.dpp = None
+                        parser.ignoring = False
+                        st["skp_gap"] = 0
+                        lc_queue.clear()
+                        st["progress_cycle"] = cycle
+                        log.add(cycle, "REC", f"device left U0; host adv "
+                                              f"will be LGOOD_{rec['host_adv']}")
+                    # Reactive TS1/TS2/idle dance, as in Polling (no LFPS
+                    # from U0 recovery).
+                    if rec["phase"] == "TS1":
+                        if v and ctrl == 0 and data == 0x45450000:
+                            feed = TS2_WORDS
+                            rec["phase"] = "TS2"
+                            st["progress_cycle"] = cycle
+                    elif rec["phase"] == "TS2":
+                        if v and (data, ctrl) == W_IDLE:
+                            feed = [W_IDLE]
+                            rec["phase"] = "IDLE"
+                            st["progress_cycle"] = cycle
+                elif train_phase == "DETECT":
                     if ctx.get(phy.perform_rx_detection):
                         ctx.set(phy.link_partner_detected, 1)
                         train_phase = "LFPS"
@@ -1470,10 +1709,72 @@ def main():
                 if not st["trained_seen"]:
                     st["trained_seen"] = True
                     st["progress_cycle"] = cycle
+                    rec["trained_at"] = cycle
                     parser.enabled = True
                     feed = None
                     log.add(cycle, "U0", "link trained")
                     print(f"link trained at cycle {cycle}")
+                elif rec["phase"] is not None and rec["entered"]:
+                    # ── scripted recovery: device re-entered U0 ───────
+                    rec["phase"] = None
+                    rec["count"] += 1
+                    rec["last"] = cycle
+                    feed = None
+                    parser.enabled = True
+                    parser.state = "IDLE"
+                    parser.hdr = []
+                    parser.dpp = None
+                    st["skp_gap"] = 0
+                    st["progress_cycle"] = cycle
+                    # Host link re-initialization [USB3.2 7.2.4.1.x]:
+                    # credit indexes restart at A on both sides; the
+                    # device re-advertises its rx buffer credits.
+                    st["host_tx_credits"] = 0
+                    st["dev_lcrd_next"] = 0
+                    st["host_lcrd_next"] = 0
+                    st["dev_adv_seen"] = False
+                    rec["adv_pending"] = True
+                    # Our Header Sequence Number Advertisement + Rx
+                    # Header Buffer Credit Advertisement.
+                    adv = build_link_command(LC_LGOOD, rec["host_adv"])
+                    for i in range(4):
+                        adv += build_link_command(LC_LCRD, i)
+                    lc_push(adv)
+                    # Protocol-level re-establishment of interrupted
+                    # grants (and payload recovery for DPPs the retrain
+                    # truncated): stale pre-recovery packets may arrive
+                    # ahead of these tokens and are discarded until the
+                    # expected sequence appears.
+                    for ep in rec["retry_eps"]:
+                        eps[ep]["reestablish"] = True
+                        grant_in_token(ep, retry=1)
+                    rec["retry_eps"] = []
+                    log.add(cycle, "REC", f"#{rec['count']} complete; "
+                                          f"host adv LGOOD_{rec['host_adv']}")
+                    print(f"recovery #{rec['count']} complete at cycle "
+                          f"{cycle}")
+                elif (rec["phase"] is None and st["addressed"]
+                        and not st["done"]
+                        and (RECOVERY_AT or RECOVERY_EVERY)):
+                    # ── scripted recovery: initiation from U0 ─────────
+                    due = False
+                    if RECOVERY_AT and rec["count"] == 0 and \
+                            cycle >= rec["trained_at"] + RECOVERY_AT:
+                        due = True
+                    if RECOVERY_EVERY and \
+                            cycle >= max(rec["last"],
+                                         rec["trained_at"]) + RECOVERY_EVERY:
+                        due = True
+                    # Never interrupt one of our own frames mid-stream:
+                    # a real retrain begins at an ordered-set boundary.
+                    if due and not rx_words:
+                        rec["phase"] = "TS1"
+                        rec["entered"] = False
+                        feed = TS1_WORDS
+                        log.add(cycle, "REC",
+                                f"#{rec['count'] + 1} initiated (TS1 feed)")
+                        print(f"recovery #{rec['count'] + 1} initiated "
+                              f"at cycle {cycle}")
 
             # ── drive device RX ───────────────────────────────────────
             if feed is not None:
@@ -1556,16 +1857,17 @@ def main():
                 # have more than WINDOW_KIB KiB unread in flight per pipe.
                 for ep in (EPS if st["addressed"] else ()):
                     e = eps[ep]
+                    out_next = e["out_idx"] + e["out_inflight"]
                     window_ok = (not WINDOW_KIB or
-                                 (e["out_idx"] + 1) * MPS
+                                 (out_next + 1) * MPS
                                  - len(e["rx_bytes"])
                                  <= WINDOW_KIB * 1024)
-                    if (not e["out_wait_ack"]
-                            and e["out_idx"] < len(packets[ep])
+                    if (e["out_inflight"] < e["out_window"]
+                            and not e["out_nrdy"]
+                            and out_next < len(packets[ep])
                             and window_ok
                             and cycle >= e["out_resume_at"]
-                            and not out_dp_queued(ep)
-                            and len(hp_queue) < 1 + NUM_EPS
+                            and len(hp_queue) < 1 + 2 * NUM_EPS
                                 + (2 * NUM_EPS if URB_PACKETS else 0)):
                         send_next_out(ep, cycle)
                     # keep the IN pipe polled; with WINDOW_KIB the reader
@@ -1602,9 +1904,7 @@ def main():
                         log.add(cycle, "host-tok-retry",
                                 f"ep={ep} nseq={e['in_seq']} "
                                 f"n={e['tok_retries']}")
-                        hp_push(frame_ack_tp(ep=ep, nseq=e["in_seq"],
-                                             nump=1, retry=1, direction=1),
-                                ("in", ep))
+                        grant_in_token(ep, nump=1, retry=1)
 
                 if not rx_words and rx_gap == 0:
                     refill_rx()
