@@ -27,7 +27,9 @@ Debug UARTs as in luna-loopback: ttyUSB4 link probe, ttyUSB5 EP1
 IN-ladder probe.  LED = link trained (U0).
 """
 
+import functools
 import importlib.util
+import operator
 import subprocess
 import sys
 from pathlib import Path
@@ -86,8 +88,9 @@ BOOT_RATE = "10G"           # proven: 10G boot + adapter rate switch to 5G
 # 114 MB/s aggregate across all three pipes -- but SUSTAINED 3-pipe
 # traffic hits a NEW intermittent failure (-71 EPROTO on two IN pipes
 # within ~µs of each other, link stays in U0, ~50% of 1 MiB/EP runs;
-# open item #23, HANDOVER 10k).  Flip to (1, 2, 3) when working on it.
-BULK_EPS = (1, 2)
+# open item #23, HANDOVER 10k/10l).  Session-8 build under test: three
+# pairs + the data_tx packet-boundary fix (bug #24).
+BULK_EPS = (1, 2, 3)
 FIFO_WORDS = 4096           # per-pair elastic buffer: 16 KiB
 
 
@@ -133,6 +136,166 @@ def create_descriptors():
                     e.wMaxPacketSize   = 1024
 
     return descriptors
+
+
+class TxWireChecker(Elaboratable):
+    """Monitors the (pre-scrambler) transmit word stream and verifies data
+    packet framing on the wire: every DP header must be followed by SDP,
+    exactly ``data_length`` payload bytes (only length%4==0 checked -- all
+    bulk packets here are 1024B), one CRC-32 word, and END framing.  For
+    aligned packets the CRC-32 itself is recomputed and compared.  Also
+    counts emitted DPs per endpoint.  Open-item-#23 probe: discriminates
+    "device emitted a malformed DP" (H2) from "device never emitted /
+    host-side loss" (H1), and link-layer CRC splice errors from
+    post-scrambler physical damage.
+
+    Inputs are the device.debug_wire_tx_* taps.  Everything registered.
+    """
+
+    def __init__(self, eps=(1, 2, 3)):
+        self._eps = eps
+        self.data   = Signal(32)
+        self.ctrl   = Signal(4)
+        self.strobe = Signal()
+        self.enable = Signal()
+
+        self.dp_seen  = {ep: Signal(name=f"dp_seen{ep}") for ep in eps}
+        self.dp_other = Signal()      # DP with an endpoint number not in eps
+        self.err      = Signal()      # framing/length violation strobe
+        self.crc_err  = Signal()      # DPP CRC-32 mismatch (aligned DPs)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        W_HPSTART = 0xF7FBFBFB
+        W_LCSTART = 0xF7FEFEFE
+        W_SDP     = 0xF75C5C5C
+        W_END     = 0xF7FDFDFD
+        K1111     = 0b1111
+
+        # Registered input stage.
+        d = Signal(32)
+        c = Signal(4)
+        v = Signal()
+        m.d.ss += [d.eq(self.data), c.eq(self.ctrl),
+                   v.eq(self.strobe & self.enable)]
+
+        dw_index  = Signal(range(5))
+        is_dp     = Signal()
+        dp_ep     = Signal(4)
+        dp_len    = Signal(16)
+        words_left = Signal(range(1024 // 4 + 2))
+        aligned   = Signal()
+
+        # Reference CRC-32 over the (aligned) payload words, using the very
+        # CRC module the link layer uses.
+        from luna.gateware.usb.usb3.link.crc import DataPacketPayloadCRC
+        m.submodules.crc32 = crc32 = DataPacketPayloadCRC()
+        crc_advance = Signal()
+        crc_clear   = Signal()
+        m.d.comb += [
+            crc32.data_input  .eq(d),
+            crc32.advance_word.eq(crc_advance),
+            crc32.clear       .eq(crc_clear),
+        ]
+
+        with m.FSM(domain="ss"):
+            with m.State("IDLE"):
+                with m.If(v & (d == W_HPSTART) & (c == K1111)):
+                    m.d.ss += dw_index.eq(0)
+                    m.next = "HDR"
+                with m.Elif(v & (d == W_LCSTART) & (c == K1111)):
+                    m.next = "LC"
+
+            with m.State("LC"):
+                with m.If(v):
+                    m.next = "IDLE"
+
+            with m.State("HDR"):
+                with m.If(v):
+                    m.d.ss += dw_index.eq(dw_index + 1)
+                    with m.If(dw_index == 0):
+                        m.d.ss += is_dp.eq(d[0:5] == 8)   # HP_DP
+                    with m.If(dw_index == 1):
+                        m.d.ss += [
+                            dp_ep .eq(d[8:12]),
+                            dp_len.eq(d[16:32]),
+                        ]
+                    with m.If(dw_index == 3):
+                        with m.If(is_dp):
+                            m.next = "EXPECT_SDP"
+                        with m.Else():
+                            m.next = "IDLE"
+
+            with m.State("EXPECT_SDP"):
+                with m.If(v):
+                    # Tally the DP by endpoint.
+                    for ep in self._eps:
+                        with m.If(dp_ep == ep):
+                            m.d.comb += self.dp_seen[ep].eq(1)
+                    if self._eps:
+                        with m.If(~functools.reduce(
+                                operator.or_,
+                                [dp_ep == ep for ep in self._eps])):
+                            m.d.comb += self.dp_other.eq(1)
+
+                    with m.If((d == W_SDP) & (c == K1111)):
+                        m.d.ss += [
+                            words_left.eq(dp_len[2:] + 1),   # payload + CRC
+                            aligned   .eq(dp_len[0:2] == 0),
+                        ]
+                        m.d.comb += crc_clear.eq(1)
+                        with m.If(dp_len == 0):
+                            # ZLP: SDP, CRC, END.
+                            m.d.ss += [words_left.eq(1), aligned.eq(1)]
+                        m.next = "DPP"
+                    with m.Else():
+                        # A DP header not followed by its payload framing.
+                        m.d.comb += self.err.eq(1)
+                        m.next = "IDLE"
+
+            with m.State("DPP"):
+                with m.If(v):
+                    with m.If(~aligned):
+                        # Unaligned tail: not length-checked (not used by
+                        # the bulk pipes); resynchronize at next END.
+                        with m.If((d == W_END) & (c == K1111)):
+                            m.next = "IDLE"
+                    with m.Elif(words_left != 1):
+                        # Payload words: feed the reference CRC.
+                        m.d.ss += words_left.eq(words_left - 1)
+                        m.d.comb += crc_advance.eq(1)
+                        with m.If(c != 0):
+                            # K symbols inside payload/CRC region: the DPP
+                            # ended early (truncated vs its header).
+                            m.d.comb += self.err.eq(1)
+                            m.next = "IDLE"
+                    with m.Elif(words_left == 1):
+                        # The CRC-32 word itself: compare with reference.
+                        m.d.ss += words_left.eq(0)
+                        with m.If(c != 0):
+                            m.d.comb += self.err.eq(1)
+                            m.next = "IDLE"
+                        with m.Elif(d != crc32.crc):
+                            m.d.comb += self.crc_err.eq(1)
+                            m.next = "RESYNC"
+                        with m.Else():
+                            m.next = "EXPECT_END"
+
+            with m.State("EXPECT_END"):
+                with m.If(v):
+                    with m.If((d == W_END) & (c == K1111)):
+                        m.next = "IDLE"
+                    with m.Else():
+                        m.d.comb += self.err.eq(1)
+                        m.next = "IDLE"
+
+            with m.State("RESYNC"):
+                # After a CRC mismatch, skip to the END framing.
+                with m.If(v & (d == W_END) & (c == K1111)):
+                    m.next = "IDLE"
+
+        return m
 
 
 class LunaMultiEpTop(Elaboratable):
@@ -182,7 +345,11 @@ class LunaMultiEpTop(Elaboratable):
             m.d.cfg += por_cnt.eq(0)
 
         m.d.cfg += [
-            por_n.eq(por_cnt > 66_000),
+            # (threshold nudged 66_000 -> 66_002: semantically null, but a
+            # content change reshuffles the deterministic PnR placement --
+            # the previous roll came in at pclk Fmax 123.6 < the 125 MHz
+            # operating gate.)
+            por_n.eq(por_cnt > 66_002),
             luna_go.eq(por_cnt.all()),
         ]
 
@@ -303,59 +470,61 @@ class LunaMultiEpTop(Elaboratable):
         m.submodules += FFSynchronizer(uart0.rx.i, rx0_unused,
                                        o_domain="dbg")
 
-        # uart 1: control-transfer (SET_ADDRESS) path probe.
-        #
-        # Localizes where the status ACK dies during the failing 3-pair
-        # enumeration.  Per second (0.35 s gate), a healthy SET_ADDRESS
-        # attempt contributes: ch0 +2 (SETUP ack + STATUS ack strobed at
-        # the control endpoint), ch1 +1 (STATUS TP received), ch2 +2
-        # (generator accepted both ACKs), ch3 +2 (both TPs entered the
-        # link header queue).  ch4 counts ss cycles in which the control
-        # interface has *latched* (fast-path-demoting) pending requests:
-        # any nonzero value means the same-cycle SET_ADDRESS contract is
-        # at risk; a huge value means a stuck pending bit.
-        # uart 1: control/handshake-path health probe.  Per gate window a
-        # healthy control transfer contributes: ch0 (any handshake
-        # dispatched) and ch2 (ACK dispatched) counts, ch1 counts received
-        # STATUS TPs, ch3 counts TPs entering the link queue; ch4 counts
-        # cycles the control interface has latched (fast-path-demoting)
-        # pending requests -- large values indicate the HANDOVER-10k
-        # arbiter wedge.
-        any_dispatch = Signal()
-        status_rx = Signal()
-        ack_dispatch = Signal()
-        tp_accepted = Signal()
-        pending0 = Signal()
-        recovery = Signal()
-        wrong_addr_ack = Signal()
+        # uart 1: TX wire checker + RX ACK probe (open item #23, H1-vs-H2
+        # discriminator).
+        #   ch0: wire-framing violations (malformed DP on the wire);
+        #   ch1/ch2/ch3: DPs emitted on the wire per endpoint 1/2/3;
+        #   ch4: host ACK TPs received (broadcast strobe, all endpoints).
+        # flags: bit0 = sticky wire-framing violation (H2 confirmed);
+        #        bit1 = sticky payload underrun (transmitter consumed an
+        #               invalid payload word -- the historical suspect #1);
+        #        bit2 = sticky DP emitted with an endpoint number outside
+        #               the configured set (misaddressed DPH);
+        #        bit3 = link trained.
+        m.submodules.txchk = txchk = TxWireChecker(eps=tuple(BULK_EPS))
+        ack_rx = Signal()
+        m.d.comb += [
+            txchk.data  .eq(usb.debug_wire_tx_data),
+            txchk.ctrl  .eq(usb.debug_wire_tx_ctrl),
+            txchk.strobe.eq(usb.debug_wire_tx_strobe),
+            txchk.enable.eq(usb.link_trained),
+        ]
+        m.d.ss += ack_rx.eq(usb.debug_ack_received)
+
+        # Resend-cause mix across all IN endpoints (probe 9): host-flagged
+        # retries (rty=1: it wants a damaged/missing DP again) vs stale
+        # acknowledgements (rty=0 but non-advancing: duplicates/replays).
+        retry_flagged = Signal()
+        stale_ack = Signal()
+        rx_dpp_invalid = Signal()
+        rx_hdr_bad = Signal()
         m.d.ss += [
-            any_dispatch.eq(usb.debug_hsk_any_dispatch),
-            status_rx.eq(usb.debug_status_received),
-            ack_dispatch.eq(usb.debug_hsk_ack_dispatch),
-            tp_accepted.eq(usb.debug_tp_hdr_accepted),
-            pending0.eq(usb.debug_hsk_pending0),
-            recovery.eq(usb.debug_recovery),
-            wrong_addr_ack.eq(usb.debug_hsk_ep0_dispatch
-                              & usb.debug_address_nonzero),
+            retry_flagged.eq(functools.reduce(operator.or_,
+                [in_eps[ep].debug_retry_flagged for ep in BULK_EPS])),
+            stale_ack.eq(functools.reduce(operator.or_,
+                [in_eps[ep].debug_stale_ack for ep in BULK_EPS])),
+            rx_dpp_invalid.eq(usb.debug_rx_dpp_invalid),
+            rx_hdr_bad.eq(usb.debug_rx_hdr_bad),
         ]
 
         sticky_bits = Signal(3)
-        with m.If(pending0):
+        with m.If(txchk.err):
             m.d.ss += sticky_bits[0].eq(1)
-        with m.If(recovery):
+        with m.If(usb.debug_payload_underrun):
             m.d.ss += sticky_bits[1].eq(1)
-        with m.If(wrong_addr_ack):
+        with m.If(txchk.crc_err):
             m.d.ss += sticky_bits[2].eq(1)
         sticky_src = Cat(sticky_bits, usb.link_trained)
 
         uart1 = platform.request("uart", 1)
+        _chan_eps = list(BULK_EPS)[:3] + [BULK_EPS[0]] * (3 - len(BULK_EPS))
         m.submodules.clkprobe = clkprobe = DomainRenamer({"cfg": "dbg"})(
             ClockFreqProbe(clk_freq=DBG_FREQ, baud=BAUD_RATE, channels=(
-                ("ss", any_dispatch),
-                ("ss", status_rx),
-                ("ss", ack_dispatch),
-                ("ss", tp_accepted),
-                ("ss", pending0),
+                ("ss", retry_flagged),
+                ("ss", rx_dpp_invalid),
+                ("ss", rx_hdr_bad),
+                ("ss", txchk.dp_seen[_chan_eps[0]]),
+                ("ss", ack_rx),
             )))
         dbg_flags = Signal(4)
         m.submodules += FFSynchronizer(sticky_src, dbg_flags, o_domain="dbg")

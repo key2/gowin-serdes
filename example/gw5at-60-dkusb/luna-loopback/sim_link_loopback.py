@@ -73,6 +73,50 @@ Env knobs:
     CTRL_PRE_GAP=n         cycles the host waits after link bringup
                            before sending the SETUP (scans the phase
                            against ITP/keepalive traffic)
+
+  xHC-shaped stimulus (HANDOVER 10k open item #23; all default off --
+  with every knob at 0 the host behaves exactly as before):
+
+    URB_PACKETS=n          model the synchronous-pyusb URB rhythm of
+                           multiep_test.py: per IN pipe, after every n
+                           received DPs the closing ACK carries NumP=0
+                           (the xHC has no buffer left -- it CANNOT grant
+                           credit), then after URB_GAP(+jitter) cycles the
+                           next URB's token repeats the same nseq with
+                           NumP=1.  Per OUT pipe, a same-sized gap is
+                           inserted after every n acknowledged DPs.
+                           The historical host (URB_PACKETS=0) never sends
+                           NumP=0 and re-tokens instantly -- a stimulus
+                           class the hardware sees at EVERY 16 KiB URB
+                           boundary.
+    URB_GAP=n              base inter-URB gap in cycles (default 2500,
+                           matching the observed 20-60 us resubmission
+                           latency of the bench host)
+    URB_JITTER=n           extra random 0..n cycles per URB gap
+    HOST_LATENCY=n         cycles between parsing a device event and the
+                           corresponding host response frame becoming
+                           eligible to send (wire + xHC latency; the
+                           historical host answers in the same cycle)
+    HOST_JITTER=n          extra random 0..n cycles per response frame
+    LC_LATENCY=n           same, for link-command responses (LGOOD/LCRD
+                           credit returns -- nonzero values make credit
+                           exhaustion and deep header queues reachable,
+                           as on hardware)
+    LC_JITTER=n            extra random 0..n cycles per link-command burst
+    PIPE_PHASE=n           random initial 0..n cycle offset per pipe
+                           before its first token/OUT (thread start skew)
+    REORDER=1              allow eligible response frames of different
+                           pipes to be sent in randomized order (per-pipe
+                           order is always preserved)
+    RETRY_TIMEOUT=n        xHC no-response behavior: if a granted IN token
+                           has produced no DP within n cycles, the host
+                           re-sends the ACK with the retry bit set (same
+                           nseq); after 3 fruitless retries the pipe is
+                           declared dead (the hardware -71 EPROTO).  The
+                           historical host waits forever, so device-side
+                           token-strobe loss is invisible to it.  Late
+                           and duplicate DPs crossing a retry are
+                           tolerated like an xHC tolerates them.
     TRACE_LO/TRACE_HI      cycle window: print every parsed TX word
     WRITE_VCD=1            dump /tmp/kilo/link_loopback.vcd
 """
@@ -96,6 +140,7 @@ from amaranth.sim import Simulator
 from luna.gateware.usb.stream import USBRawSuperSpeedStream
 from luna.gateware.usb.usb3.link.layer import USB3LinkLayer
 from luna.gateware.usb.usb3.physical.ctc import CTCSkipInserter, TxStreamSkidBuffer
+from luna.gateware.usb.usb3.physical.scrambling import Scrambler, Descrambler
 from luna.gateware.usb.usb3.endpoints.control import USB3ControlEndpoint
 from usb_protocol.emitters import SuperSpeedDeviceDescriptorCollection
 from luna.gateware.usb.usb3.protocol.layer import USB3ProtocolLayer
@@ -128,6 +173,16 @@ ITP_EVERY    = int(os.environ.get("ITP_EVERY", 0))
 HOST_LDN_EVERY = int(os.environ.get("HOST_LDN_EVERY", 0))
 CTRL_GAP     = int(os.environ.get("CTRL_GAP", 0))
 CTRL_PRE_GAP = int(os.environ.get("CTRL_PRE_GAP", 0))
+URB_PACKETS  = int(os.environ.get("URB_PACKETS", 0))
+URB_GAP      = int(os.environ.get("URB_GAP", 2500))
+URB_JITTER   = int(os.environ.get("URB_JITTER", 0))
+HOST_LATENCY = int(os.environ.get("HOST_LATENCY", 0))
+HOST_JITTER  = int(os.environ.get("HOST_JITTER", 0))
+LC_LATENCY   = int(os.environ.get("LC_LATENCY", 0))
+LC_JITTER    = int(os.environ.get("LC_JITTER", 0))
+PIPE_PHASE   = int(os.environ.get("PIPE_PHASE", 0))
+REORDER      = int(os.environ.get("REORDER", 0))
+RETRY_TIMEOUT = int(os.environ.get("RETRY_TIMEOUT", 0))
 TRACE_LO     = int(os.environ.get("TRACE_LO", 0))
 TRACE_HI     = int(os.environ.get("TRACE_HI", 0))
 MPS          = 1024
@@ -273,7 +328,8 @@ def frame_ack_tp(*, ep, nseq, nump, retry=0, direction=1):
            | ((nump & 0x1F) << 16)
            | ((nseq & 0x1F) << 21))
     return {"dw0": dw0, "dw1": dw1, "dw2": 0, "payload": None,
-            "kind": f"ACK(nseq={nseq},rty={retry})"}
+            "tok_ep": ep, "tok_nump": nump,
+            "kind": f"ACK(nseq={nseq},rty={retry},nump={nump})"}
 
 
 def frame_out_dp(ep, data_seq, payload: bytes, *, setup=0, address=DEV_ADDRESS):
@@ -405,10 +461,16 @@ class LinkBench(Elaboratable):
         self.in_eps = {ep: SuperSpeedStreamInEndpoint(
             endpoint_number=ep, max_packet_size=MPS, generate_zlps=False)
             for ep in EPS}
-        # Real TX conditioning stages, exactly as in physical/layer.py
-        # (minus the scrambler, which is data-neutral at this boundary).
+        # Real TX conditioning stages, exactly as in physical/layer.py --
+        # INCLUDING the scrambler (paired with a real descrambler at the
+        # host boundary).  The scrambler was originally omitted here as
+        # "data-neutral", which hid its interaction with the skid stage:
+        # its forced-valid sink turned skid bubbles into stale garbage
+        # words on the hardware wire (bug #28, HANDOVER 10l).
         self.tx_skid = TxStreamSkidBuffer()
+        self.tx_scrambler = Scrambler(initial_value=0xffff)
         self.tx_ctc = CTCSkipInserter()
+        self.host_descrambler = Descrambler(initial_value=0xffff)
 
     def elaborate(self, platform):
         m = Module()
@@ -421,7 +483,9 @@ class LinkBench(Elaboratable):
             m.submodules[f"out_ep{ep}"] = self.out_eps[ep]
             m.submodules[f"in_ep{ep}"] = self.in_eps[ep]
         m.submodules.tx_skid = self.tx_skid
+        m.submodules.tx_scrambler = self.tx_scrambler
         m.submodules.tx_ctc = self.tx_ctc
+        m.submodules.host_descrambler = self.host_descrambler
 
         # Endpoint wiring, exactly as USBSuperSpeedDevice does it.
         shared = self.mux.shared
@@ -466,15 +530,47 @@ class LinkBench(Elaboratable):
             m.d.comb += self.in_eps[ep].stream.stream_eq(
                 self.out_eps[ep].stream)
 
-        # TX conditioning: link sink -> skid -> skip inserter -> consumer,
-        # with the insertion qualifier derived from the post-skid stream's
-        # own packet-boundary markers, as in the real physical layer.
+        # TX conditioning: link sink -> skid -> scrambler -> skip inserter,
+        # wired exactly as the real physical layer (physical/layer.py),
+        # including the scrambler's always-valid sink; then a real
+        # descrambler standing in for the host's receiver, so any stale
+        # word the conditioning chain fabricates reaches the host parser
+        # exactly as it reaches the wire.
         m.d.comb += [
-            self.tx_skid.sink         .stream_eq(self.phy.sink),
-            self.tx_ctc.sink          .stream_eq(self.tx_skid.source),
-            self.tx_ctc.can_send_skip .eq(self.tx_skid.source.valid &
-                                          self.tx_skid.source.first),
+            self.tx_skid.sink              .stream_eq(self.phy.sink),
+
+            self.tx_scrambler.enable       .eq(1),
+            self.tx_scrambler.sink         .stream_eq(self.tx_skid.source,
+                                                      omit={'valid', 'data',
+                                                            'ctrl'}),
+            self.tx_scrambler.sink.valid   .eq(1),
+            # Bug-#28 fix, as in physical/layer.py: skid bubbles become
+            # logical idle, never a stale word.
+            self.tx_scrambler.sink.data    .eq(Mux(self.tx_skid.source.valid,
+                                                   self.tx_skid.source.data,
+                                                   0)),
+            self.tx_scrambler.sink.ctrl    .eq(Mux(self.tx_skid.source.valid,
+                                                   self.tx_skid.source.ctrl,
+                                                   0)),
+
+            self.tx_ctc.sink               .stream_eq(self.tx_scrambler.source),
+            self.tx_ctc.can_send_skip      .eq(self.tx_skid.source.valid &
+                                               self.tx_skid.source.first),
+            self.tx_scrambler.hold         .eq(self.tx_ctc.sending_skip),
+
+            # Host-side view: descramble everything except SKPs (the real
+            # receiver's CTC removes them before descrambling; here the
+            # host model skips SKP words itself, so hold the descrambler
+            # LFSR while they pass).  The CTC's output is registered, so
+            # the SKP word lags ``sending_skip`` by one cycle.
+            self.host_descrambler.enable   .eq(1),
+            self.host_descrambler.sink     .stream_eq(self.tx_ctc.source,
+                                                      omit={'ready'}),
+            self.tx_ctc.source.ready       .eq(self.host_descrambler.sink.ready),
         ]
+        skp_on_wire = Signal()
+        m.d.ss += skp_on_wire.eq(self.tx_ctc.sending_skip)
+        m.d.comb += self.host_descrambler.hold.eq(skp_on_wire)
 
         return m
 
@@ -721,6 +817,7 @@ def main():
         "lbads_sent": 0, "lbads_taken": 0, "aborted_dps": 0,
         "lbad_seq": None,             # exp seq to restore after LRTY
         # bookkeeping
+        "now": 0,
         "progress_cycle": 0,
         "skp_gap": 0, "max_skp_gap": 0,
         "lc_counts": {}, "hdr_counts": {},
@@ -734,15 +831,49 @@ def main():
         "out_retry": 0, "out_nrdy": False, "out_retrans": 0,
         "in_seq": 0, "in_parked": False, "in_token": False,
         "rx_bytes": bytearray(),
+        # xHC URB-rhythm modeling (URB_PACKETS).
+        "in_urb_left":  URB_PACKETS,
+        "out_urb_left": URB_PACKETS,
+        "in_resume_at":  0,
+        "out_resume_at": 0,
+        # xHC no-response retry modeling (RETRY_TIMEOUT).
+        "tok_sent_at": None,          # cycle the outstanding token went out
+        "tok_retries": 0,
     } for ep in EPS}
 
     # Frames the host still has to transmit.  Link commands preempt
     # header frames; header frames consume a device rx-buffer credit.
     # Retried frames (after a device LBAD) bypass the credit gate.
-    lc_queue = []      # flat word list
+    #
+    # Each hp_queue frame carries a ``flow`` key and a ``ready`` cycle:
+    # per-flow order is FIFO (protocol requirement), but with REORDER=1
+    # different flows' eligible heads may be sent in any order, and with
+    # HOST_LATENCY/HOST_JITTER a frame only becomes eligible some cycles
+    # after it was queued -- the xHC's response latency.  lc_queue
+    # entries are (ready, words) bursts with the same eligibility rule.
+    lc_queue = []      # list of (ready_cycle, flat word list)
     hp_queue = []      # list of frame dicts (unsent; credit-gated)
     hp_resend = []     # list of (seq, frame) to retransmit with DL=1
     unacked = []       # list of (seq, frame) sent, awaiting device LGOOD
+
+    flow_last_ready = {}
+
+    def _flow_ready(flow, base, latency, jitter):
+        """Monotonic per-flow eligibility cycle (order is never inverted)."""
+        t = base + latency + (rng.randint(0, jitter) if jitter else 0)
+        t = max(t, flow_last_ready.get(flow, 0))
+        flow_last_ready[flow] = t
+        return t
+
+    def lc_push(words):
+        lc_queue.append((_flow_ready("lc", st["now"], LC_LATENCY,
+                                     LC_JITTER), words))
+
+    def hp_push(frame, flow, *, earliest=None):
+        frame["flow"] = flow
+        base = st["now"] if earliest is None else max(st["now"], earliest)
+        frame["ready"] = _flow_ready(flow, base, HOST_LATENCY, HOST_JITTER)
+        hp_queue.append(frame)
 
     def fail(msg, ctx=None):
         log.dump()
@@ -790,11 +921,13 @@ def main():
 
     # -- host protocol reactions -----------------------------------------
 
-    def grant_in_token(ep, nump=1, retry=0):
+    def grant_in_token(ep, nump=1, retry=0, earliest=None):
         e = eps[ep]
-        hp_queue.append(frame_ack_tp(ep=ep, nseq=e["in_seq"],
-                                     nump=nump, retry=retry, direction=1))
-        e["in_token"] = True
+        hp_push(frame_ack_tp(ep=ep, nseq=e["in_seq"],
+                             nump=nump, retry=retry, direction=1),
+                ("in", ep), earliest=earliest)
+        if nump:
+            e["in_token"] = True
 
     def alloc_hdr_seq():
         seq = st["host_hdr_seq"]
@@ -811,7 +944,7 @@ def main():
         e = eps[ep]
         idx = e["out_idx"]
         data = packets[ep][idx]
-        hp_queue.append(frame_out_dp(ep, e["out_seq"], data))
+        hp_push(frame_out_dp(ep, e["out_seq"], data), ("out", ep))
         e["out_wait_ack"] = True
         log.add(cycle, "host-OUT", f"ep={ep} idx={idx} dseq={e['out_seq']} "
                                    f"len={len(data)}")
@@ -822,7 +955,7 @@ def main():
         st["lbads_sent"] += 1
         st["lbad_seq"] = info["seq"]      # expected seq resumes here
         parser.ignoring = True
-        lc_queue.extend(build_link_command(LC_LBAD, 0))
+        lc_push(build_link_command(LC_LBAD, 0))
         log.add(cycle, "host-LBAD", f"rejected seq={info['seq']} "
                                     f"type={info['type']}")
 
@@ -881,7 +1014,7 @@ def main():
                 # send LRTY, then retransmit every unacknowledged header
                 # with the DL bit set [USB3.2r1: 7.2.4.1.10].
                 st["lbads_taken"] += 1
-                lc_queue.extend(build_link_command(LC_LRTY, 0))
+                lc_push(build_link_command(LC_LRTY, 0))
                 hp_resend.extend(unacked)
                 log.add(cycle, "host-LRTY",
                         f"resending {[s for s, _ in unacked]}")
@@ -928,8 +1061,8 @@ def main():
             st["progress_cycle"] = cycle
 
     def host_ack_header(seq):
-        lc_queue.extend(build_link_command(LC_LGOOD, seq))
-        lc_queue.extend(build_link_command(LC_LCRD, st["host_lcrd_next"]))
+        lc_push(build_link_command(LC_LGOOD, seq)
+                + build_link_command(LC_LCRD, st["host_lcrd_next"]))
         st["host_lcrd_next"] = (st["host_lcrd_next"] + 1) & 0x3
     st["host_lcrd_next"] = 0
 
@@ -983,6 +1116,15 @@ def main():
                     e["out_idx"] += 1
                     e["out_wait_ack"] = False
                     st["progress_cycle"] = cycle
+                    # URB rhythm: the writer's next 16 KiB URB reaches the
+                    # xHC only after a resubmission gap.
+                    if URB_PACKETS:
+                        e["out_urb_left"] -= 1
+                        if e["out_urb_left"] <= 0:
+                            e["out_urb_left"] = URB_PACKETS
+                            e["out_resume_at"] = cycle + URB_GAP + \
+                                (rng.randint(0, URB_JITTER) if URB_JITTER
+                                 else 0)
                 # else: duplicate ACK of an already-completed packet.
             elif nseq == e["out_seq"]:
                 # Device expects the current packet (again).
@@ -1039,6 +1181,16 @@ def main():
         dseq = info["data_seq"]
         log.add(cycle, "dev-DP",
                 f"ep={ep} dseq={dseq} len={len(info['payload'])}")
+        if RETRY_TIMEOUT and dseq == ((e["in_seq"] - 1) & 0x1F):
+            # Duplicate of the previous packet (a late original crossing a
+            # no-response retry, or a retry-induced resend): an xHC
+            # discards it and re-issues the current expectation.
+            log.add(cycle, "host-dup", f"ep={ep} dseq={dseq} ignored")
+            e["in_token"] = False
+            e["tok_sent_at"] = None
+            if not any(f.get("flow") == ("in", ep) for f in hp_queue):
+                grant_in_token(ep)
+            return
         if dseq != e["in_seq"]:
             fail(f"device DP ep={ep} sequence {dseq}, "
                  f"expected {e['in_seq']}")
@@ -1064,7 +1216,23 @@ def main():
         e["rx_bytes"].extend(info["payload"])
         e["in_seq"] = (e["in_seq"] + 1) & 0x1F
         e["in_token"] = False
+        e["tok_sent_at"] = None
+        e["tok_retries"] = 0
         st["progress_cycle"] = cycle
+        if URB_PACKETS:
+            e["in_urb_left"] -= 1
+            if e["in_urb_left"] <= 0 and len(e["rx_bytes"]) < TOTAL_BYTES:
+                # URB boundary: the xHC has no transfer ring buffer left,
+                # so the closing ACK CANNOT grant credit -- NumP=0.  The
+                # next URB's token then repeats the same nseq with NumP=1
+                # after the resubmission gap.
+                e["in_urb_left"] = URB_PACKETS
+                grant_in_token(ep, nump=0)
+                resume = cycle + URB_GAP + \
+                    (rng.randint(0, URB_JITTER) if URB_JITTER else 0)
+                e["in_resume_at"] = resume
+                grant_in_token(ep, earliest=resume)
+                return
         # ACK doubles as the next IN token, like an xHC.
         grant_in_token(ep)
 
@@ -1073,7 +1241,7 @@ def main():
     # -- main host coroutine ---------------------------------------------
 
     async def host(ctx):
-        ctc_src = bench.tx_ctc.source
+        ctc_src = bench.host_descrambler.source
         ctx.set(ctc_src.ready, 1)
         ctx.set(phy.vbus_present, 1)
         ctx.set(phy.ready, 1)
@@ -1090,12 +1258,16 @@ def main():
         def refill_rx():
             nonlocal rx_words
             if lc_queue:
-                # link commands preempt and are never credit-gated
-                n = len(lc_queue)
-                rx_words = lc_queue[:n]
-                del lc_queue[:n]
-                log.add(cycle, "host-lc-burst", f"{n} words")
-                return
+                # link commands preempt and are never credit-gated; they
+                # are sent in FIFO order once their (latency-modeled)
+                # eligibility cycle arrives.
+                burst = []
+                while lc_queue and lc_queue[0][0] <= cycle:
+                    burst.extend(lc_queue.pop(0)[1])
+                if burst:
+                    rx_words = burst
+                    log.add(cycle, "host-lc-burst", f"{len(burst)} words")
+                    return
             if hp_resend:
                 # Link-level retransmission after a device LBAD: original
                 # sequence numbers, DL=1, no fresh credit consumed.
@@ -1104,8 +1276,24 @@ def main():
                 rx_words = frame_to_words(frame, seq, delayed=1)
                 return
             if hp_queue and st["host_tx_credits"] > 0:
+                # Eligible = per-flow head frames whose ready cycle has
+                # arrived.  Default: the first eligible frame in queue
+                # order (exactly the historical FIFO when latencies are
+                # 0); REORDER=1 picks randomly among eligible flows.
+                seen_flows = set()
+                eligible = []
+                for i, f in enumerate(hp_queue):
+                    flow = f.get("flow")
+                    if flow in seen_flows:
+                        continue
+                    seen_flows.add(flow)
+                    if f.get("ready", 0) <= cycle:
+                        eligible.append(i)
+                if not eligible:
+                    return
+                idx = rng.choice(eligible) if REORDER else eligible[0]
                 st["host_tx_credits"] -= 1
-                frame = hp_queue.pop(0)
+                frame = hp_queue.pop(idx)
                 seq = alloc_hdr_seq()
                 unacked.append((seq, frame))
                 if len(unacked) > 8:
@@ -1116,6 +1304,9 @@ def main():
                     fail(f"LGOOD starvation: {len(unacked)} headers "
                          f"unacknowledged: {[s for s, _ in unacked]}")
                 st["host_hdr_count"] += 1
+                # Stamp outstanding-token dispatch time (RETRY_TIMEOUT).
+                if frame.get("tok_ep") in eps and frame.get("tok_nump"):
+                    eps[frame["tok_ep"]]["tok_sent_at"] = cycle
                 corrupt = bool(BADHDR_EVERY) and \
                     st["host_hdr_count"] > 4 and \
                     st["host_hdr_count"] % BADHDR_EVERY == 0
@@ -1127,6 +1318,7 @@ def main():
         while not st["done"]:
             await ctx.tick("ss")
             cycle += 1
+            st["now"] = cycle
 
             # ── consume device TX (post skip-inserter) ────────────────
             trained = ctx.get(bench.link.trained)
@@ -1201,6 +1393,34 @@ def main():
                 if n_tx > 1:
                     st["tx_overlap"] = st.get("tx_overlap", 0) + 1
 
+            # ── TX handoff-boundary monitor (DBG_HANDOFF=1) ───────────
+            # Watches the endpoint-mux -> skid -> DataPacketTransmitter
+            # chain across mux grant handoffs: the shared transmitter
+            # delimits packets by a one-cycle valid gap, and the skid
+            # stage can compress that gap away when it spans a frozen,
+            # occupied buffer (open item #23 investigation).
+            if os.environ.get("DBG_HANDOFF") and st["trained_seen"]:
+                mux_v = ctx.get(bench.mux.shared.tx.valid) != 0
+                skid_v = ctx.get(bench.link.data_sink.valid) != 0
+                dtx = ctx.get(bench.link.debug_dtx_fsm)
+                key = st.get("_ho")
+                snap = (mux_v, skid_v, dtx)
+                if snap != key:
+                    st["_ho"] = snap
+                    log.add(cycle, "handoff",
+                            f"muxv={int(mux_v)} skidv={int(skid_v)} "
+                            f"dtx={dtx}")
+                # Invariant: data_tx only enters SEND_HEADER (1) from
+                # WAIT_FOR_DATA (0) -- an entry from SEND_PAYLOAD would
+                # mean a packet boundary was never observed.
+                prev_dtx = st.get("_dtx_prev", 0)
+                if dtx == 1 and prev_dtx not in (0, 1):
+                    fail(f"cycle {cycle}: data_tx offered a header without "
+                         f"passing WAIT_FOR_DATA since the previous packet "
+                         f"(mux handoff boundary compressed; prev state "
+                         f"{prev_dtx})")
+                st["_dtx_prev"] = dtx
+
             # ── recovery-cause diagnostics ────────────────────────────
             if st["trained_seen"]:
                 if ctx.get(bench.link.debug_payload_underrun):
@@ -1268,25 +1488,32 @@ def main():
                 if not advertised:
                     # host link bringup: sequence advertisement + credits
                     advertised = True
-                    lc_queue.extend(build_link_command(LC_LGOOD, 7))
+                    adv = build_link_command(LC_LGOOD, 7)
                     for i in range(4):
-                        lc_queue.extend(build_link_command(LC_LCRD, i))
+                        adv += build_link_command(LC_LCRD, i)
+                    lc_push(adv)
                     # LMP dance like a real host
-                    hp_queue.append(frame_lmp(4, dw0_extra=(1 << 9),
-                                              dw1=(4 | (1 << 16))))
-                    hp_queue.append(frame_lmp(5, dw0_extra=(1 << 9)))
+                    hp_push(frame_lmp(4, dw0_extra=(1 << 9),
+                                      dw1=(4 | (1 << 16))), ("mgmt",))
+                    hp_push(frame_lmp(5, dw0_extra=(1 << 9)), ("mgmt",))
                     if not WITH_CONTROL:
-                        # open the IN pipes
+                        # open the IN pipes (with the thread-start skew of
+                        # the bench harness, when modeled)
                         for ep in EPS:
-                            grant_in_token(ep)
+                            phase = rng.randint(0, PIPE_PHASE) \
+                                if PIPE_PHASE else 0
+                            grant_in_token(ep, earliest=cycle + phase)
+                            eps[ep]["out_resume_at"] = cycle + \
+                                (rng.randint(0, PIPE_PHASE)
+                                 if PIPE_PHASE else 0)
 
                 # Background traffic a real xHC generates around (and
                 # during) the control exchange: periodic ITP headers and
                 # LDN keepalive link commands.
                 if ITP_EVERY and cycle % ITP_EVERY == 0:
-                    hp_queue.append(frame_itp(cycle))
+                    hp_push(frame_itp(cycle), ("mgmt",))
                 if HOST_LDN_EVERY and cycle % HOST_LDN_EVERY == 0:
-                    lc_queue.extend(build_link_command(LC_LDN, 0))
+                    lc_push(build_link_command(LC_LDN, 0))
 
                 # SET_ADDRESS control transfer, before any bulk traffic
                 # (mirrors real enumeration: it is the first transfer the
@@ -1301,8 +1528,9 @@ def main():
                             st["ctrl_wait"] = 0
                             setup = bytes([0x00, 0x05, DEV_ADDRESS, 0x00,
                                            0x00, 0x00, 0x00, 0x00])
-                            hp_queue.append(frame_out_dp(0, 0, setup,
-                                                         setup=1, address=0))
+                            hp_push(frame_out_dp(0, 0, setup,
+                                                 setup=1, address=0),
+                                    ("ctrl",))
                             log.add(cycle, "ctrl", "SETUP(SET_ADDRESS) sent")
                             st["ctrl_step"] = 1
                     elif st["ctrl_step"] == 2:
@@ -1310,14 +1538,18 @@ def main():
                             st["ctrl_wait"] += 1
                         else:
                             st["ctrl_wait"] = 0
-                            hp_queue.append(frame_status_tp(0, address=0))
+                            hp_push(frame_status_tp(0, address=0), ("ctrl",))
                             log.add(cycle, "ctrl", "STATUS sent")
                             st["ctrl_step"] = 3
                 elif WITH_CONTROL and st["addressed"] and \
                         not st.get("pipes_open"):
                     st["pipes_open"] = True
                     for ep in EPS:
-                        grant_in_token(ep)
+                        phase = rng.randint(0, PIPE_PHASE) \
+                            if PIPE_PHASE else 0
+                        grant_in_token(ep, earliest=cycle + phase)
+                        eps[ep]["out_resume_at"] = cycle + \
+                            (rng.randint(0, PIPE_PHASE) if PIPE_PHASE else 0)
 
                 # protocol engines, per endpoint pair: keep the OUT pipes
                 # saturated.  With WINDOW_KIB, mimic window_test.py: never
@@ -1331,8 +1563,10 @@ def main():
                     if (not e["out_wait_ack"]
                             and e["out_idx"] < len(packets[ep])
                             and window_ok
+                            and cycle >= e["out_resume_at"]
                             and not out_dp_queued(ep)
-                            and len(hp_queue) < 1 + NUM_EPS):
+                            and len(hp_queue) < 1 + NUM_EPS
+                                + (2 * NUM_EPS if URB_PACKETS else 0)):
                         send_next_out(ep, cycle)
                     # keep the IN pipe polled; with WINDOW_KIB the reader
                     # only starts once the initial window has been written
@@ -1347,8 +1581,30 @@ def main():
                                      or e["out_idx"] >= len(packets[ep]))
                     if (reads_started
                             and not e["in_parked"] and not e["in_token"]
+                            and cycle >= e["in_resume_at"]
+                            and not any(f.get("flow") == ("in", ep)
+                                        for f in hp_queue)
                             and len(e["rx_bytes"]) < TOTAL_BYTES):
                         grant_in_token(ep)
+
+                    # xHC no-response retry: a granted token with no DP
+                    # for RETRY_TIMEOUT cycles is re-issued with the retry
+                    # bit; three fruitless retries kill the pipe (-71).
+                    if (RETRY_TIMEOUT and e["in_token"]
+                            and e["tok_sent_at"] is not None
+                            and cycle - e["tok_sent_at"] > RETRY_TIMEOUT):
+                        e["tok_retries"] += 1
+                        if e["tok_retries"] > 3:
+                            fail(f"cycle {cycle}: ep{ep} IN pipe DEAD: no "
+                                 f"DP after 3 no-response retries "
+                                 f"(hardware -71 EPROTO signature)", None)
+                        e["tok_sent_at"] = None
+                        log.add(cycle, "host-tok-retry",
+                                f"ep={ep} nseq={e['in_seq']} "
+                                f"n={e['tok_retries']}")
+                        hp_push(frame_ack_tp(ep=ep, nseq=e["in_seq"],
+                                             nump=1, retry=1, direction=1),
+                                ("in", ep))
 
                 if not rx_words and rx_gap == 0:
                     refill_rx()
