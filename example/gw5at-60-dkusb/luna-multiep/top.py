@@ -72,7 +72,7 @@ _spec = importlib.util.spec_from_file_location(
 _enum_top = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_enum_top)
 ClockFreqProbe = _enum_top.ClockFreqProbe
-from uart import AsyncSerialTX      # usb31-enum dir (on sys.path via exec above)
+from uart import AsyncSerialRX, AsyncSerialTX   # usb31-enum dir (on sys.path)
 
 # ── Configuration ─────────────────────────────────────────────────────
 QUAD, LANE = 0, 1
@@ -837,9 +837,29 @@ class LunaMultiEpTop(Elaboratable):
             clkprobe.flags.eq(dbg_flags),
             uart1.tx.o.eq(clkprobe.tx_o),
         ]
-        rx1_unused = Signal()
-        m.submodules += FFSynchronizer(uart1.rx.i, rx1_unused,
-                                       o_domain="dbg")
+        # uart1 RX: debug command channel.  Byte 'R' (0x52) forces ONE
+        # link recovery entry from U0 -- the hardware verdict path for
+        # the recovery-retransmit conformance fixes (#29-#31): traffic
+        # must resume and stay sha-exact across the retrain.  NOTE:
+        # during the forced-recovery test itself the host may
+        # legitimately send rty=1 re-establishment ACKs, so uart1 ch0
+        # ticking DURING that test is expected; it must read 0 again in
+        # normal runs.
+        m.submodules.uart1_rx = rx1 = DomainRenamer("dbg")(
+            AsyncSerialRX(divisor=DBG_FREQ // BAUD_RATE))
+        rx1_i = Signal(init=1)
+        m.submodules += FFSynchronizer(uart1.rx.i, rx1_i, o_domain="dbg",
+                                       init=1)
+        m.d.comb += [rx1.i.eq(rx1_i), rx1.ack.eq(1)]
+        forcerec_tgl = Signal()
+        with m.If(rx1.rdy & (rx1.data == ord("R"))):
+            m.d.dbg += forcerec_tgl.eq(~forcerec_tgl)
+        forcerec_s = Signal()
+        m.submodules += FFSynchronizer(forcerec_tgl, forcerec_s,
+                                       o_domain="ss")
+        forcerec_d = Signal()
+        m.d.ss += forcerec_d.eq(forcerec_s)
+        m.d.comb += usb.debug_force_recovery.eq(forcerec_s != forcerec_d)
 
         # Bug-#34 field probe (uart0, ACKPROBE builds only): first 64
         # bulk-EP header events -- TX DPH/TP dw1 straight off the wire,

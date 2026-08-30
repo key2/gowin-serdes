@@ -253,6 +253,11 @@ IN_TOKEN_DELAY = int(os.environ.get("IN_TOKEN_DELAY", 0))
 # Host scheduling gap between a burst-terminating ACK (rule 9249, EOB)
 # and the token that opens the next burst (per-packet-ack mode only).
 EOB_RETOKEN_GAP = int(os.environ.get("EOB_RETOKEN_GAP", 800))
+# Strobe the device's force_recovery debug hook at this absolute cycle
+# (one shot; may fire pre-addressing and at any cycle -- the rule-2d
+# stimulus needs cycle-exact recovery entry relative to a header's
+# reception).  0 = off.
+FORCE_REC_AT = int(os.environ.get("FORCE_REC_AT", 0))
 BURST        = int(os.environ.get("BURST", 1))
 TRACE_LO     = int(os.environ.get("TRACE_LO", 0))
 TRACE_HI     = int(os.environ.get("TRACE_HI", 0))
@@ -1717,6 +1722,11 @@ def main():
                                 f"exp_seq={ctx.get(bench.link.debug_rx_expected_seq)}")
 
             # ── link training script ──────────────────────────────────
+            # One-shot clear for the forced-recovery debug strobe.
+            if st.get("force_rec_strobed") is not None \
+                    and cycle > st["force_rec_strobed"]:
+                ctx.set(bench.link.force_recovery, 0)
+                st["force_rec_strobed"] = None
             if not trained:
                 if st["trained_seen"] and rec["phase"] is None:
                     fail(f"cycle {cycle}: link dropped out of U0 "
@@ -1849,6 +1859,33 @@ def main():
                                           f"host adv LGOOD_{rec['host_adv']}")
                     print(f"recovery #{rec['count']} complete at cycle "
                           f"{cycle}")
+                elif (FORCE_REC_AT and rec["phase"] is None
+                        and not st.get("force_rec_done")
+                        and cycle >= FORCE_REC_AT):
+                    # ── forced recovery: the device-side debug hook ────
+                    # (link.force_recovery, the #29-#31 hardware-verdict
+                    # path).  Unlike the scripted host-initiated retrain
+                    # this may fire pre-addressing and at ANY cycle --
+                    # cycle-exact placement is the point (the rule-2d
+                    # acked-but-undrained window is 1-2 cycles wide).
+                    st["force_rec_done"] = True
+                    ctx.set(bench.link.force_recovery, 1)
+                    st["force_rec_strobed"] = cycle
+                    rec["phase"] = "TS1"
+                    rec["entered"] = False
+                    # A retrain kills whatever the host had in flight ON
+                    # THE WIRE: link commands are link-local and are
+                    # never resumed after recovery, and a header/DPP cut
+                    # here models the real truncation.  (The scripted
+                    # initiation gates on a frame boundary instead;
+                    # forced recovery deliberately does not.)  Block the
+                    # refill until the device has actually left U0, so
+                    # no fresh frame is popped-and-lost in the 2-4 cycle
+                    # reaction window.
+                    rx_words = []
+                    rx_gap = 16
+                    log.add(cycle, "REC", "forced (device debug hook)")
+                    print(f"forced recovery strobed at cycle {cycle}")
                 elif (rec["phase"] is None and st["addressed"]
                         and not st["done"]
                         and (RECOVERY_AT or RECOVERY_EVERY)):
