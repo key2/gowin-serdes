@@ -91,3 +91,12 @@ Programming: the board's Mini USB-B download port is an **FT232H**
 ("FTDI Single RS232-HS", `/dev/ttyUSB1` on the bench) —
 `openFPGALoader -c ft232 <bitstream.fs>`, verified working
 (`programmer_cable = "ft232"`).
+
+## LUNA-stack examples moved
+
+The LUNA SuperSpeed examples that used to live here (`luna-enum`,
+`luna-acm`, `luna-loopback`, `luna-multiep`, and the link-partner
+simulation battery) moved to the **luna-ss** fork
+(`examples/gowin/` and `sim/` there), which consumes this repo as a
+submodule.  The vendor-stack `usb31-enum` (A/B baseline) and
+`uart-hello` stay here.
