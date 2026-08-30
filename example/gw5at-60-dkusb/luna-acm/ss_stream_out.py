@@ -392,18 +392,41 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
         fill_count = Signal(range(words + 1))
         can_capture = (occupied != ring)
 
+        # A packet that lost ANY word to a full ring is unusable: the
+        # ring can become non-full MID-PACKET (a drain completing frees
+        # a buffer while the DP is still streaming in), after which a
+        # naive occupancy check at completion time would commit the
+        # captured TAIL as a complete packet -- or, for a packet dropped
+        # entirely, treat ``fill_count == 0`` as a phantom ZLP and
+        # advance the sequence number over 1024 vanished bytes (bug #35,
+        # reproduced by the OUT_WINDOW0 blast stimulus: the bench xHC
+        # pipelines its whole scheduling window at transfer start).
+        # Latch the loss; adjudication below then takes the same
+        # NRDY-and-park path as the ring-full case, and the host
+        # retransmits after our ERDY.
+        packet_lost = Signal()
+
         rx_word_valid = rx.valid.any() & is_our_packet
+        # Whether THIS word may be captured: a first word restarts the
+        # packet's fate regardless of a stale loss latch (which
+        # adjudication normally consumes, but a DPP truncated by a
+        # retrain never completes and would leave it set).
+        word_ok = can_capture & (rx.first | ~packet_lost)
         for i in range(ring):
             m.d.comb += [
                 wr_ports[i].data.eq(Cat(rx.payload, rx.valid)),
                 wr_ports[i].addr.eq(Mux(rx.first, 0, fill_count)),
-                wr_ports[i].en  .eq((wr_idx == i) & can_capture
+                wr_ports[i].en  .eq((wr_idx == i) & word_ok
                                     & rx_word_valid),
             ]
-        with m.If(can_capture & rx_word_valid):
+        with m.If(rx_word_valid):
             with m.If(rx.first):
-                m.d.ss += fill_count.eq(1)
-            with m.Else():
+                m.d.ss += packet_lost.eq(~can_capture)
+                with m.If(can_capture):
+                    m.d.ss += fill_count.eq(1)
+            with m.Elif(~can_capture):
+                m.d.ss += packet_lost.eq(1)
+            with m.Elif(~packet_lost):
                 m.d.ss += fill_count.eq(fill_count + 1)
 
         m.d.comb += [
@@ -414,7 +437,10 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
         # ── packet adjudication (strobe-driven; no FSM needed) ───────
         with m.If(interface.rx_complete & is_our_packet):
 
-            with m.If(seq_matches & (occupied != ring)):
+            # The loss latch is consumed by every outcome below.
+            m.d.ss += packet_lost.eq(0)
+
+            with m.If(seq_matches & (occupied != ring) & ~packet_lost):
 
                 with m.If(fill_count != 0):
                     # Commit the packet and acknowledge it immediately;
@@ -447,10 +473,13 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
                     m.d.ss += expected_seq.eq(expected_seq + 1)
 
             with m.Elif(seq_matches):
-                # In-sequence packet but the ring is full (the host
-                # overran our advertisement, or raced our ACK): discard
-                # and park the pipe; the ERDY after the next drain
-                # reopens it and the host retransmits.
+                # In-sequence packet, but the ring was full -- either
+                # still full now, or full when any of its words arrived
+                # (``packet_lost``: the capture is a partial tail, or
+                # nothing at all -- bug #35).  The host overran our
+                # advertisement or raced our ACK: discard and park the
+                # pipe; the ERDY after the next drain reopens it and the
+                # host retransmits this packet.
                 m.d.comb += handshakes_out.send_nrdy.eq(1)
                 m.d.ss += [
                     fill_count .eq(0),
@@ -475,7 +504,10 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
                 handshakes_out.number_of_packets .eq(ring - occupied),
                 handshakes_out.send_ack          .eq(1),
             ]
-            m.d.ss += fill_count.eq(0)
+            m.d.ss += [
+                fill_count .eq(0),
+                packet_lost.eq(0),
+            ]
 
         # ── drain engine ─────────────────────────────────────────────
         position = Signal(range(words + 1))
@@ -538,6 +570,7 @@ class SuperSpeedStreamOutEndpoint(Elaboratable):
                 rd_idx      .eq(0),
                 occupied    .eq(0),
                 erdy_needed .eq(0),
+                packet_lost .eq(0),
             ]
 
         return m

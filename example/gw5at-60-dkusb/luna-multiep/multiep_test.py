@@ -27,9 +27,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mib", nargs="?", type=float, default=4.0,
                     help="MiB to echo per endpoint pair (default 4)")
-    ap.add_argument("--eps", default="1,2",
-                    help="comma-separated endpoint numbers (default 1,2; the\n"
-                         "shipping build has two pairs -- see top.py)")
+    ap.add_argument("--eps", default="1,2,3",
+                    help="comma-separated endpoint numbers (default 1,2,3; the\n"
+                         "shipping build has three pairs -- see top.py)")
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="skip the serial 1 KiB warmup echo (bug-#34 probe "
+                         "runs: keeps the event capture for the burst phase)")
     args = ap.parse_args()
 
     eps = [int(e) for e in args.eps.split(",")]
@@ -65,12 +68,13 @@ def main():
             errors.append(f"ep{ep} reader: {e!r} (rx={len(rx[ep])})")
 
     # warmup: one packet through each pipe, serially
-    for ep in eps:
-        probe = os.urandom(1024)
-        dev.write(ep, probe, timeout=3000)
-        back = bytes(dev.read(0x80 | ep, 1024, timeout=3000))
-        assert back == probe, f"ep{ep} warmup mismatch"
-    print("warmup echo OK on all pipes")
+    if not args.no_warmup:
+        for ep in eps:
+            probe = os.urandom(1024)
+            dev.write(ep, probe, timeout=3000)
+            back = bytes(dev.read(0x80 | ep, 1024, timeout=3000))
+            assert back == probe, f"ep{ep} warmup mismatch"
+        print("warmup echo OK on all pipes")
 
     threads = [threading.Thread(target=fn, args=(ep,), daemon=True)
                for ep in eps for fn in (writer, reader)]

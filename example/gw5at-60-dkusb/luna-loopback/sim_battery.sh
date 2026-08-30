@@ -41,17 +41,26 @@ run "rec+ctrl" RECOVERY_AT=1500 WITH_CONTROL=1 NUM_EPS=3 LOOPBACK_BYTES=8192
 run "rec+urb" RECOVERY_EVERY=3000 NUM_EPS=3 URB_PACKETS=4 URB_GAP=800 HOST_LATENCY=20 LC_LATENCY=12 REORDER=1
 # bMaxBurst>1 engines (session 9): multi-packet bursts per token, per-packet
 # sequence advance, cumulative ACKs, EOB, rewind-on-retry, OUT window
-# advertisement.  (Recovery below 1800-cycle periods with 3 bursting pipes
-# is a starvation regime -- recovery overhead eats the service windows --
-# not a correctness bound; see HANDOVER 10m.)
+# advertisement.  (Recovery below ~2600-cycle periods with 3 bursting pipes
+# is a starvation regime -- recovery overhead plus the spec-correct
+# EOB/terminating-ACK/ERDY round trip per burst (session 10) eats the
+# service windows -- not a correctness bound; see HANDOVER 10m/10n.)
 run "burst" BURST=4 NUMP=4 NUM_EPS=3
 run "burst+sweep" BURST=4 NUMP=4 NUMP_SWEEP=1 NUM_EPS=2
 run "burst+lbad" BURST=4 NUMP=4 LBAD_EVERY=5
 run "burst+badhdr" BURST=4 NUMP=4 BADHDR_EVERY=7
 run "burst+short" BURST=4 NUMP=4 LOOPBACK_BYTES=1028
-run "burst+rec" BURST=4 NUMP=4 RECOVERY_EVERY=1800 NUM_EPS=3
+run "burst+rec" BURST=4 NUMP=4 RECOVERY_EVERY=2600 NUM_EPS=3
 run "burst+urb" BURST=4 NUMP=4 NUM_EPS=3 URB_PACKETS=4 URB_GAP=800 HOST_LATENCY=20 LC_LATENCY=12 REORDER=1
 run "burst+ctrl" BURST=2 NUMP=2 WITH_CONTROL=1 NUM_EPS=3 LOOPBACK_BYTES=8192
+# bug-#35 regression (session 10): the bench xHC pipelines its whole
+# scheduling window at transfer start (16 back-to-back OUT DPs before any
+# device ACK); with the hardware's elastic loopback FIFO behind the OUT
+# engine, the ring can become non-full MID-PACKET and the un-fixed engine
+# commits partial tails / phantom ZLPs (the BURST=2 2048-byte bench wedge).
+run "burst+blast" BURST=2 NUMP=2 OUT_WINDOW0=16 WITH_FIFO=4096 NUM_EPS=1 LOOPBACK_BYTES=65536 RETRY_TIMEOUT=1500
+run "burst+blast3" BURST=2 NUMP=2 OUT_WINDOW0=16 WITH_FIFO=4096 NUM_EPS=3 LOOPBACK_BYTES=32768 RETRY_TIMEOUT=2500
+run "blast+fifo1" BURST=1 NUMP=1 OUT_WINDOW0=16 WITH_FIFO=4096 NUM_EPS=1 LOOPBACK_BYTES=65536 RETRY_TIMEOUT=1500
 if pdm run python "$LL/sim_loopback.py" > /tmp/kilo/batt_ep.log 2>&1; then
     echo "PASS endpoint-sim"
 else

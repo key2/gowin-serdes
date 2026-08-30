@@ -50,6 +50,7 @@ sys.path.insert(0, str(LUNA_ROOT))              # luna
 from amaranth.hdl import *
 from amaranth.lib.cdc import FFSynchronizer
 from amaranth.lib.fifo import SyncFIFOBuffered
+from amaranth.lib.memory import Memory
 
 from dk_usb_gw5at60 import DKUSBGW5AT60Platform, add_serdes_refclk_forward
 
@@ -71,6 +72,7 @@ _spec = importlib.util.spec_from_file_location(
 _enum_top = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_enum_top)
 ClockFreqProbe = _enum_top.ClockFreqProbe
+from uart import AsyncSerialTX      # usb31-enum dir (on sys.path via exec above)
 
 # ── Configuration ─────────────────────────────────────────────────────
 QUAD, LANE = 0, 1
@@ -96,14 +98,22 @@ FIFO_WORDS = 4096           # per-pair elastic buffer: 16 KiB
 
 # Burst depth (packets in flight per pipe; descriptors advertise
 # bMaxBurst = max(BURST_IN, BURST_OUT) - 1).  1 elaborates the
-# historical single-packet engines -- the verified shipping default.
-# The burst engines are sim-green (see HANDOVER 10m) but FAILED their
-# first hardware rung (pipe wedge after the first 2-packet burst; wire
-# clean, retry_flagged=0): bring-up needs an ACK-TP field probe.  The
-# per-direction knobs are the discriminator for that session.
-BURST     = int(os.environ.get("MULTIEP_BURST", 1))
+# historical single-packet engines (the session-9 shipping default).
+# Session 10 closed the burst hardware bring-up (bug #34: post-EOB
+# grant discipline + ERDY-on-NumP=0 in the IN engine; bug #35 in the
+# OUT engine's capture gating): the full BURST=2 hardware ladder is
+# green -- 1 MiB x10, 16/64 MiB x3 pipes, 64 MiB x3 x10 soak, 94 MB/s
+# per direction per pipe (283 MB/s aggregate), retry_flagged=0
+# throughout -- so 2 is the shipping default now.  Set MULTIEP_BURST=1
+# to rebuild the historical single-packet image.
+BURST     = int(os.environ.get("MULTIEP_BURST", 2))
 BURST_IN  = int(os.environ.get("MULTIEP_BURST_IN", BURST))
 BURST_OUT = int(os.environ.get("MULTIEP_BURST_OUT", BURST))
+
+# Bug-#34 field probe: when set, uart0 carries the BurstEventCapture dump
+# (the first 64 bulk-endpoint header events, raw DW1 words) instead of
+# the link probe.  uart1 (wire checker; retry_flagged) is unaffected.
+ACKPROBE  = int(os.environ.get("MULTIEP_ACKPROBE", 0))
 
 
 def make_serdes():
@@ -180,6 +190,19 @@ class TxWireChecker(Elaboratable):
         self.err      = Signal()      # framing/length violation strobe
         self.crc_err  = Signal()      # DPP CRC-32 mismatch (aligned DPs)
 
+        # Bug-#34 field capture: DW1 of every transmitted DP / transaction
+        # header whose endpoint field is a bulk endpoint (EP0 excluded)
+        # -- plus, once ``armed`` is high, EP0 *data* headers as well
+        # (a ghost DPH with stale/reset parameters would carry ep=0 and
+        # is invisible to every other counter; arming on the first bulk
+        # event keeps enumeration's legitimate EP0 traffic out).
+        # Strobed with the word for one cycle; ``cap_tp``=1 marks a TP
+        # (subtype self-describing in dw1[0:4]), 0 a data packet header.
+        self.armed    = Signal()
+        self.cap_stb  = Signal()
+        self.cap_tp   = Signal()
+        self.cap_dw1  = Signal(32)
+
     def elaborate(self, platform):
         m = Module()
 
@@ -198,6 +221,7 @@ class TxWireChecker(Elaboratable):
 
         dw_index  = Signal(range(5))
         is_dp     = Signal()
+        is_tp     = Signal()
         dp_ep     = Signal(4)
         dp_len    = Signal(16)
         words_left = Signal(range(1024 // 4 + 2))
@@ -231,12 +255,26 @@ class TxWireChecker(Elaboratable):
                 with m.If(v):
                     m.d.ss += dw_index.eq(dw_index + 1)
                     with m.If(dw_index == 0):
-                        m.d.ss += is_dp.eq(d[0:5] == 8)   # HP_DP
+                        m.d.ss += [
+                            is_dp.eq(d[0:5] == 8),   # HP_DP
+                            is_tp.eq(d[0:5] == 4),   # HP_TRANSACTION
+                        ]
                     with m.If(dw_index == 1):
                         m.d.ss += [
                             dp_ep .eq(d[8:12]),
                             dp_len.eq(d[16:32]),
                         ]
+                        # Bug-#34 field capture: both DPH and TP dw1 carry
+                        # the endpoint number at [8:12]; EP0 (enumeration)
+                        # traffic is excluded -- except EP0 DPHs once the
+                        # capture is armed (ghost-DPH hunt).
+                        with m.If(((is_dp | is_tp) & (d[8:12] != 0))
+                                  | (is_dp & self.armed)):
+                            m.d.comb += [
+                                self.cap_stb.eq(1),
+                                self.cap_tp .eq(is_tp),
+                                self.cap_dw1.eq(d),
+                            ]
                     with m.If(dw_index == 3):
                         with m.If(is_dp):
                             m.next = "EXPECT_SDP"
@@ -317,6 +355,248 @@ class TxWireChecker(Elaboratable):
                 # After a CRC mismatch, skip to the END framing.
                 with m.If(v & (d == W_END) & (c == K1111)):
                     m.next = "IDLE"
+
+        return m
+
+
+class BurstEventCapture(Elaboratable):
+    """Bug-#34 field probe: captures the first ``depth`` bulk-endpoint
+    protocol events after training, in arrival order, and dumps them
+    continuously over UART.
+
+    Event sources (``ss`` domain):
+      * the TxWireChecker's header-field capture (transmitted DPH / TP
+        dw1 words, straight off the pre-scrambler wire);
+      * the device's RX header tap (every ACK TP / DPH the link layer
+        delivered to the protocol layer, raw dw1).
+
+    Capture is write-once: it stops when the ring is full, preserving
+    the FIRST mid-burst acknowledgement exchange -- exactly where the
+    BURST=2 images die on the bench.  The dump side (``dbg`` domain)
+    reads entries through a request/ack handshake CDC (ClockFreqProbe
+    pattern; no gray-code assumptions) and cycles forever:
+
+        #NN F\\r\\n            -- sweep header: NN = events captured (hex),
+                                 F = 1 if an event was lost to a skid
+                                 collision (three same-cycle events)
+        II cXXXXXXXX\\r\\n     -- entry II: c = D (TX DPH), T (TX TP),
+                                 A (RX TP), R (RX DPH), . (empty);
+                                 XXXXXXXX = the header's DW1, hex
+
+    Decode: DPH dw1 = dseq[0:5] eob[6] dir[7] ep[8:12] len[16:32];
+    ACK TP dw1 = subtype[0:4] rty[6] dir[7] ep[8:12] herr[15]
+    nump[16:21] nseq[21:26] (subtype 1=ACK 2=NRDY 3=ERDY).
+    """
+
+    DEPTH = 64
+
+    def __init__(self, clk_freq, baud=115_200):
+        self._divisor = clk_freq // baud
+
+        # Event port A: TX header capture (from TxWireChecker).
+        self.a_stb = Signal()
+        self.a_tp  = Signal()          # 1 = transaction packet, 0 = DPH
+        self.a_dw1 = Signal(32)
+        # Event port B: RX header capture (from the device tap).
+        self.b_stb = Signal()
+        self.b_tag = Signal(3)         # 3 = RX TP, 4 = RX DPH
+        self.b_dw1 = Signal(32)
+
+        self.tx_o  = Signal(init=1)
+
+    def elaborate(self, platform):
+        m = Module()
+        depth = self.DEPTH
+
+        # ── capture ring (ss domain, write-once) ─────────────────────
+        m.submodules.ring = ring = Memory(shape=35, depth=depth, init=[])
+        wr = ring.write_port(domain="ss")
+        rd = ring.read_port(domain="ss")
+
+        wptr = Signal(range(depth + 1))
+        full = wptr == depth
+        lost = Signal()
+
+        # One-deep skid for a same-cycle A+B collision: A is written
+        # first, B waits one cycle.  A third event during the skid is
+        # lost (flagged); at header rates that window is negligible.
+        skid_v   = Signal()
+        skid_tag = Signal(3)
+        skid_dw1 = Signal(32)
+
+        a_tag = Mux(self.a_tp, 2, 1)
+
+        m.d.comb += wr.en.eq(0)
+        with m.If(~full):
+            with m.If(self.a_stb):
+                m.d.comb += [
+                    wr.en  .eq(1),
+                    wr.addr.eq(wptr),
+                    wr.data.eq(Cat(self.a_dw1, a_tag)),
+                ]
+                m.d.ss += wptr.eq(wptr + 1)
+                with m.If(self.b_stb):
+                    with m.If(skid_v):
+                        m.d.ss += lost.eq(1)
+                    with m.Else():
+                        m.d.ss += [
+                            skid_v  .eq(1),
+                            skid_tag.eq(self.b_tag),
+                            skid_dw1.eq(self.b_dw1),
+                        ]
+            with m.Elif(skid_v):
+                m.d.comb += [
+                    wr.en  .eq(1),
+                    wr.addr.eq(wptr),
+                    wr.data.eq(Cat(skid_dw1, skid_tag)),
+                ]
+                m.d.ss += [wptr.eq(wptr + 1), skid_v.eq(0)]
+                with m.If(self.b_stb):
+                    m.d.ss += [
+                        skid_v  .eq(1),
+                        skid_tag.eq(self.b_tag),
+                        skid_dw1.eq(self.b_dw1),
+                    ]
+            with m.Elif(self.b_stb):
+                m.d.comb += [
+                    wr.en  .eq(1),
+                    wr.addr.eq(wptr),
+                    wr.data.eq(Cat(self.b_dw1, self.b_tag)),
+                ]
+                m.d.ss += wptr.eq(wptr + 1)
+
+        # ── entry readout: request/ack handshake CDC ─────────────────
+        # dbg sets ``idx`` then toggles ``req``; ss latches the entry
+        # into a holding register and answers with ``ack``.  The
+        # multi-bit values are only sampled when their producers have
+        # been stable for at least one synchronizer delay.
+        idx   = Signal(range(depth))    # dbg domain
+        req   = Signal()                # dbg domain toggle
+        hold  = Signal(35)              # ss domain, read by dbg when stable
+
+        req_s = Signal()
+        m.submodules += FFSynchronizer(req, req_s, o_domain="ss")
+        req_d = Signal()
+        m.d.ss += req_d.eq(req_s)
+
+        ack       = Signal()            # ss domain toggle
+        rd_wait   = Signal()
+        m.d.comb += rd.addr.eq(idx)     # stable long before req edge arrives
+        with m.If(req_s != req_d):
+            m.d.ss += rd_wait.eq(1)     # address settled; data next cycle
+        with m.Elif(rd_wait):
+            m.d.ss += [
+                hold   .eq(rd.data),
+                rd_wait.eq(0),
+                ack    .eq(~ack),
+            ]
+
+        ack_s = Signal()
+        m.submodules += FFSynchronizer(ack, ack_s, o_domain="dbg")
+        ack_d = Signal()
+        m.d.dbg += ack_d.eq(ack_s)
+        entry_ready = ack_s != ack_d    # hold stable >= 2 dbg cycles ago
+
+        # Status snapshot (quasi-static once capture stops; a torn read
+        # during the microseconds of active capture is acceptable).
+        wcount_s = Signal.like(wptr)
+        lost_s   = Signal()
+        m.submodules += FFSynchronizer(wptr, wcount_s, o_domain="dbg")
+        m.submodules += FFSynchronizer(lost, lost_s, o_domain="dbg")
+
+        # ── UART line formatter (dbg domain) ─────────────────────────
+        tx = AsyncSerialTX(divisor=self._divisor)
+        m.submodules.tx = DomainRenamer("dbg")(tx)
+        m.d.comb += self.tx_o.eq(tx.o)
+
+        def hexchar(nib):
+            return Mux(nib < 10, ord("0") + nib, ord("a") - 10 + nib)
+
+        tag  = hold[32:35]
+        word = hold[0:32]
+        tag_char = Signal(8)
+        with m.Switch(tag):
+            with m.Case(1):
+                m.d.comb += tag_char.eq(ord("D"))
+            with m.Case(2):
+                m.d.comb += tag_char.eq(ord("T"))
+            with m.Case(3):
+                m.d.comb += tag_char.eq(ord("A"))
+            with m.Case(4):
+                m.d.comb += tag_char.eq(ord("R"))
+            with m.Default():
+                m.d.comb += tag_char.eq(ord("."))
+
+        # Entry line: II cXXXXXXXX\r\n (14 chars).
+        ENTRY_LEN = 14
+        entry_char = Signal(8)
+        cpos = Signal(range(ENTRY_LEN))
+        with m.Switch(cpos):
+            with m.Case(0):
+                m.d.comb += entry_char.eq(hexchar(Cat(idx, C(0, 2))[4:8]))
+            with m.Case(1):
+                m.d.comb += entry_char.eq(hexchar(idx[0:4]))
+            with m.Case(2):
+                m.d.comb += entry_char.eq(ord(" "))
+            with m.Case(3):
+                m.d.comb += entry_char.eq(tag_char)
+            for j in range(8):
+                with m.Case(4 + j):
+                    m.d.comb += entry_char.eq(
+                        hexchar(word[(7 - j) * 4:(8 - j) * 4]))
+            with m.Case(ENTRY_LEN - 2):
+                m.d.comb += entry_char.eq(ord("\r"))
+            with m.Case(ENTRY_LEN - 1):
+                m.d.comb += entry_char.eq(ord("\n"))
+
+        # Status line: #NN F\r\n (7 chars).
+        STATUS_LEN = 7
+        status_char = Signal(8)
+        wcount8 = Signal(8)
+        m.d.comb += wcount8.eq(wcount_s)
+        with m.Switch(cpos):
+            with m.Case(0):
+                m.d.comb += status_char.eq(ord("#"))
+            with m.Case(1):
+                m.d.comb += status_char.eq(hexchar(wcount8[4:8]))
+            with m.Case(2):
+                m.d.comb += status_char.eq(hexchar(wcount8[0:4]))
+            with m.Case(3):
+                m.d.comb += status_char.eq(ord(" "))
+            with m.Case(4):
+                m.d.comb += status_char.eq(ord("0") + lost_s)
+            with m.Case(5):
+                m.d.comb += status_char.eq(ord("\r"))
+            with m.Case(6):
+                m.d.comb += status_char.eq(ord("\n"))
+
+        with m.FSM(domain="dbg"):
+
+            with m.State("STATUS"):
+                m.d.comb += [tx.data.eq(status_char), tx.ack.eq(1)]
+                with m.If(tx.rdy):
+                    with m.If(cpos == STATUS_LEN - 1):
+                        m.d.dbg += [cpos.eq(0), idx.eq(0), req.eq(~req)]
+                        m.next = "FETCH"
+                    with m.Else():
+                        m.d.dbg += cpos.eq(cpos + 1)
+
+            with m.State("FETCH"):
+                with m.If(entry_ready):
+                    m.next = "ENTRY"
+
+            with m.State("ENTRY"):
+                m.d.comb += [tx.data.eq(entry_char), tx.ack.eq(1)]
+                with m.If(tx.rdy):
+                    with m.If(cpos == ENTRY_LEN - 1):
+                        m.d.dbg += cpos.eq(0)
+                        with m.If(idx == depth - 1):
+                            m.next = "STATUS"
+                        with m.Else():
+                            m.d.dbg += [idx.eq(idx + 1), req.eq(~req)]
+                            m.next = "FETCH"
+                    with m.Else():
+                        m.d.dbg += cpos.eq(cpos + 1)
 
         return m
 
@@ -470,25 +750,27 @@ class LunaMultiEpTop(Elaboratable):
                       & (adapter.rx_data[0:8] == 0xBC)),
         ]
 
-        # uart 0: link-event probe.
+        # uart 0: link-event probe -- or, in an ACKPROBE build, the
+        # bug-#34 header-field capture dump (see BurstEventCapture).
         uart0 = platform.request("uart", 0)
-        m.submodules.linkprobe = linkprobe = DomainRenamer({"cfg": "dbg"})(
-            ClockFreqProbe(clk_freq=DBG_FREQ, baud=BAUD_RATE, channels=(
-                ("ss", None),
-                ("ss", usb.debug_lfps_polling_detected),
-                ("ss", usb.debug_ts1_detected),
-                ("ss", usb.debug_ts2_detected),
-                ("ss", rx_com),
-            )))
-        link_flags = Signal(4)
-        m.submodules += FFSynchronizer(
-            Cat(usb.link_trained, usb.link_in_reset,
-                usb.debug_phy_ready, usb.debug_engage_terminations),
-            link_flags, o_domain="dbg")
-        m.d.comb += [
-            linkprobe.flags.eq(link_flags),
-            uart0.tx.o.eq(linkprobe.tx_o),
-        ]
+        if not ACKPROBE:
+            m.submodules.linkprobe = linkprobe = DomainRenamer({"cfg": "dbg"})(
+                ClockFreqProbe(clk_freq=DBG_FREQ, baud=BAUD_RATE, channels=(
+                    ("ss", None),
+                    ("ss", usb.debug_lfps_polling_detected),
+                    ("ss", usb.debug_ts1_detected),
+                    ("ss", usb.debug_ts2_detected),
+                    ("ss", rx_com),
+                )))
+            link_flags = Signal(4)
+            m.submodules += FFSynchronizer(
+                Cat(usb.link_trained, usb.link_in_reset,
+                    usb.debug_phy_ready, usb.debug_engage_terminations),
+                link_flags, o_domain="dbg")
+            m.d.comb += [
+                linkprobe.flags.eq(link_flags),
+                uart0.tx.o.eq(linkprobe.tx_o),
+            ]
         rx0_unused = Signal()
         m.submodules += FFSynchronizer(uart0.rx.i, rx0_unused,
                                        o_domain="dbg")
@@ -558,6 +840,35 @@ class LunaMultiEpTop(Elaboratable):
         rx1_unused = Signal()
         m.submodules += FFSynchronizer(uart1.rx.i, rx1_unused,
                                        o_domain="dbg")
+
+        # Bug-#34 field probe (uart0, ACKPROBE builds only): first 64
+        # bulk-EP header events -- TX DPH/TP dw1 straight off the wire,
+        # RX TP/DPH dw1 as accepted by the protocol layer.
+        if ACKPROBE:
+            m.submodules.evcap = evcap = BurstEventCapture(
+                clk_freq=DBG_FREQ, baud=BAUD_RATE)
+            rx_is_tp = usb.debug_rx_hdr_type == 4
+            rx_is_dp = usb.debug_rx_hdr_type == 8
+            m.d.comb += [
+                evcap.a_stb.eq(txchk.cap_stb),
+                evcap.a_tp .eq(txchk.cap_tp),
+                evcap.a_dw1.eq(txchk.cap_dw1),
+
+                evcap.b_stb.eq(usb.debug_rx_hdr_stb
+                               & (rx_is_tp | rx_is_dp)
+                               & (usb.debug_rx_hdr_dw1[8:12] != 0)),
+                evcap.b_tag.eq(Mux(rx_is_tp, 3, 4)),
+                evcap.b_dw1.eq(usb.debug_rx_hdr_dw1),
+
+                uart0.tx.o.eq(evcap.tx_o),
+            ]
+            # Ghost-DPH hunt: arm the EP0-DPH capture from the first bulk
+            # event onward (keeps enumeration's legitimate EP0 data
+            # stages out of the ring).
+            cap_armed = Signal()
+            with m.If(evcap.a_stb | evcap.b_stb):
+                m.d.ss += cap_armed.eq(1)
+            m.d.comb += txchk.armed.eq(cap_armed)
 
         return m
 

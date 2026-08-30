@@ -148,6 +148,16 @@ Env knobs:
                            packet of the previous one; asserts the
                            device sets EOB on the final granted packet.
     NUMP_SWEEP=1           randomize each grant in 1..NUMP
+    OUT_WINDOW0=n          initial OUT in-flight limit before the first
+                           device ACK (bench xHC: 16 back-to-back DPs at
+                           transfer start -- the bug-#34 stimulus; the
+                           spec window rule only binds the host once an
+                           ACK exists).  Default 1 = historical host.
+    WITH_FIFO=words        insert a per-pair elastic loopback FIFO between
+                           the OUT and IN endpoints, as luna-multiep does
+                           on hardware (4096 words = 16 KiB there;
+                           includes the registered packet_space gate).
+                           Default 0 = historical direct wiring.
     BURST=n                device-side burst depth for the IN endpoints
                            (max packets in flight; the descriptor would
                            advertise bMaxBurst = n-1).  Default 1 = the
@@ -223,6 +233,26 @@ RECOVERY_EVERY = int(os.environ.get("RECOVERY_EVERY", 0))
 NUMP         = int(os.environ.get("NUMP", 1))
 NUMP_SWEEP   = int(os.environ.get("NUMP_SWEEP", 0))
 COALESCE_ACKS = int(os.environ.get("COALESCE_ACKS", 0))
+# Initial OUT-pipe in-flight limit, BEFORE the first device ACK arrives.
+# The bench xHC pipelines its whole internal scheduling window at
+# transfer start -- 16 back-to-back DPs observed on the wire (bug #34
+# field probe) -- and only then collapses to the device's advertised
+# NumP.  The spec's window rule [USB3.2 8.12.1.2] binds the host to
+# "the NumP field in the LAST ACK TP received", which does not exist
+# yet at burst start.  Default 1 = the historical polite host.
+OUT_WINDOW0  = int(os.environ.get("OUT_WINDOW0", 1))
+# Elastic loopback FIFO depth in words (0 = direct OUT->IN wiring).
+WITH_FIFO    = int(os.environ.get("WITH_FIFO", 0))
+# Absolute cycle before which the host issues no IN tokens: models the
+# bench reader thread starting after the writer has already filled the
+# loopback FIFO -- the first token then lands on a fully-primed IN
+# engine (ready packets waiting, full grant), which dispatches
+# back-to-back through the shared TX path.  Default 0 = poll from the
+# start (the token then arrives before data and takes the NRDY path).
+IN_TOKEN_DELAY = int(os.environ.get("IN_TOKEN_DELAY", 0))
+# Host scheduling gap between a burst-terminating ACK (rule 9249, EOB)
+# and the token that opens the next burst (per-packet-ack mode only).
+EOB_RETOKEN_GAP = int(os.environ.get("EOB_RETOKEN_GAP", 800))
 BURST        = int(os.environ.get("BURST", 1))
 TRACE_LO     = int(os.environ.get("TRACE_LO", 0))
 TRACE_HI     = int(os.environ.get("TRACE_HI", 0))
@@ -573,9 +603,36 @@ class LinkBench(Elaboratable):
             self.mux.add_interface(self.out_eps[ep].interface)
             self.mux.add_interface(self.in_eps[ep].interface)
 
-            # Bulk echo per pair: OUT drains into IN.
-            m.d.comb += self.in_eps[ep].stream.stream_eq(
-                self.out_eps[ep].stream)
+            if WITH_FIFO:
+                # Elastic loopback buffer, exactly as luna-multiep wires
+                # it on hardware (including the registered packet_space
+                # accept gate).
+                from amaranth.lib.fifo import SyncFIFOBuffered
+                from amaranth.hdl import DomainRenamer
+                fifo = SyncFIFOBuffered(width=32 + 4 + 1, depth=WITH_FIFO)
+                m.submodules[f"loop_fifo{ep}"] = \
+                    DomainRenamer({"sync": "ss"})(fifo)
+                out_ep, in_ep = self.out_eps[ep], self.in_eps[ep]
+                out_ep.packet_space = Signal(name=f"packet_space{ep}")
+                m.d.comb += [
+                    fifo.w_data.eq(Cat(out_ep.stream.payload,
+                                       out_ep.stream.valid,
+                                       out_ep.stream.last)),
+                    fifo.w_en.eq(out_ep.stream.valid.any() & fifo.w_rdy),
+                    out_ep.stream.ready.eq(fifo.w_rdy),
+
+                    in_ep.stream.payload.eq(fifo.r_data[0:32]),
+                    in_ep.stream.valid.eq(Mux(fifo.r_rdy,
+                                              fifo.r_data[32:36], 0)),
+                    in_ep.stream.last.eq(fifo.r_data[36]),
+                    fifo.r_en.eq(fifo.r_rdy & in_ep.stream.ready),
+                ]
+                m.d.ss += out_ep.packet_space.eq(
+                    (WITH_FIFO - fifo.level) >= 260)
+            else:
+                # Bulk echo per pair: OUT drains into IN.
+                m.d.comb += self.in_eps[ep].stream.stream_eq(
+                    self.out_eps[ep].stream)
 
         # TX conditioning: link sink -> skid -> scrambler -> skip inserter,
         # wired exactly as the real physical layer (physical/layer.py),
@@ -881,7 +938,8 @@ def main():
         # send-one-wait-ack rhythm).  ``out_idx``/``out_seq`` are the
         # ACKNOWLEDGED boundary; ``out_inflight`` packets beyond it have
         # been sent (or queued) and await acknowledgement.
-        "out_idx": 0, "out_seq": 0, "out_inflight": 0, "out_window": 1,
+        "out_idx": 0, "out_seq": 0, "out_inflight": 0,
+        "out_window": OUT_WINDOW0,
         "out_retry": 0, "out_nrdy": False, "out_retrans": 0,
         "in_seq": 0, "in_parked": False, "in_token": False,
         "grant_left": 0,              # packets remaining on the IN grant
@@ -889,8 +947,9 @@ def main():
         "rx_bytes": bytearray(),
         # xHC URB-rhythm modeling (URB_PACKETS).
         "in_urb_left":  URB_PACKETS,
+        "burst_closed": False,
         "out_urb_left": URB_PACKETS,
-        "in_resume_at":  0,
+        "in_resume_at":  IN_TOKEN_DELAY,
         "out_resume_at": 0,
         # xHC no-response retry modeling (RETRY_TIMEOUT).
         "tok_sent_at": None,          # cycle the outstanding token went out
@@ -1002,6 +1061,14 @@ def main():
         e["grant_left"] = nump
         if nump:
             e["in_token"] = True
+            e["burst_closed"] = False
+        if retry:
+            # Any retry token rewinds the device to our expected
+            # sequence [USB3.2r1: 8.12.1.2, rule 9499]; packets it had
+            # already launched past that point are void and an xHC
+            # discards them until the expected one arrives.  (The same
+            # tolerance the post-recovery re-establishment uses.)
+            e["reestablish"] = True
 
     def alloc_hdr_seq():
         seq = st["host_hdr_seq"]
@@ -1295,6 +1362,15 @@ def main():
         dseq = info["data_seq"]
         log.add(cycle, "dev-DP",
                 f"ep={ep} dseq={dseq} len={len(info['payload'])}")
+        if e.get("burst_closed"):
+            # Between the terminating ACK (rule 9249) and the next
+            # burst's token, the pipe is closed: an xHC discards any DP
+            # arriving in that window (the device may have launched it
+            # on a stale pre-EOB grant).  The flag clears when the next
+            # token is granted (after the device's reopening ERDY).
+            log.add(cycle, "host-post-eob",
+                    f"ep={ep} dseq={dseq} discarded (burst closed)")
+            return
         if RETRY_TIMEOUT and dseq == ((e["in_seq"] - 1) & 0x1F):
             # Duplicate of the previous packet (a late original crossing a
             # no-response retry, or a retry-induced resend): an xHC
@@ -1370,6 +1446,26 @@ def main():
                     e["in_resume_at"] = resume
                     grant_in_token(ep, earliest=resume)
                     return
+            if info.get("eob"):
+                # Rule 9249 [USB3.2r1: 8.12.1.2]: a DP with EOB set
+                # terminates the burst -- the host responds with a
+                # terminating ACK (NumP=0) and DISCARDS any further DPs
+                # of the closed burst (e.g. one the device launched on a
+                # stale pre-EOB per-packet grant -- the bug-#34 bench
+                # wedge).  The NumP=0 ACK is a flow-control condition
+                # [8.10.1]: the host does NOT token again on its own;
+                # the DEVICE must reopen the pipe with an ERDY (the
+                # bench xHC otherwise crawls on its multi-second
+                # no-response re-poll timer).  The token-grant loop
+                # resumes once the ERDY clears ``in_parked``.
+                grant_in_token(ep, nump=0)
+                if len(e["rx_bytes"]) < TOTAL_BYTES:
+                    e["burst_closed"] = True
+                    e["in_parked"] = True
+                    e["in_token"] = False
+                    e["tok_sent_at"] = None
+                    e["in_resume_at"] = cycle + EOB_RETOKEN_GAP
+                return
             grant_in_token(ep)
             return
 
@@ -1868,7 +1964,8 @@ def main():
                             and window_ok
                             and cycle >= e["out_resume_at"]
                             and len(hp_queue) < 1 + 2 * NUM_EPS
-                                + (2 * NUM_EPS if URB_PACKETS else 0)):
+                                + (2 * NUM_EPS if URB_PACKETS else 0)
+                                + (OUT_WINDOW0 - 1)):
                         send_next_out(ep, cycle)
                     # keep the IN pipe polled; with WINDOW_KIB the reader
                     # only starts once the initial window has been written
