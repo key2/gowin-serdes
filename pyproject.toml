@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gowin-serdes"
+version = "0.1.0"
+description = "Python/Amaranth generator for the Gowin GTR12 SerDes (TOML/CSR/instantiation), with the proven USB3 recipe"
+authors = [
+    {name = "key2", email = "key2@users.noreply.github.com"},
+]
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "amaranth>=0.5.9",
+]
+
+[tool.setuptools]
+packages = ["gowin_serdes"]
