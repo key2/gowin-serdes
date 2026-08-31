@@ -341,7 +341,16 @@ class DKUSBGW5AT60Platform(GowinPlatform):
         # luna_enum only met 125 MHz by luck, and the first design with a
         # bit more ss-domain logic (luna_acm) missed it and failed EP0
         # handshakes on hardware ("Device not responding to setup address").
-        if name in ("luna_enum", "luna_acm", "luna_loopback", "luna_multiep"):
+        #
+        # The Gen2 (SuperSpeedPlus) tops run pclk/rxclk at 156.25 MHz as
+        # their OPERATING point, so the same 6.4 ns constraints are a hard
+        # requirement there.  Note the mutual false paths also matter for
+        # honest reports: without them, skew-tolerant CDC handshakes (the
+        # ClockFreqProbe snapshot reads, for one) are analyzed as real
+        # inter-clock paths against the auto-created 100 MHz base clocks
+        # and mask the design's own cones.
+        if name in ("luna_enum", "luna_acm", "luna_loopback", "luna_multiep",
+                    "luna_enum_gen2", "luna_multiep_gen2"):
             sdc_constraints = [
                 "create_clock -name pclk -period 6.4 "
                 "[get_nets {serdes_pcs_tx_clk_i}]",
@@ -364,6 +373,23 @@ class DKUSBGW5AT60Platform(GowinPlatform):
                 "set_false_path -from [get_clocks {clk_24m_0__io}] "
                 "-to [get_clocks {pclk rxclk upar_clk sys_clk_0__p}]",
             ]
+            if name in ("luna_enum_gen2", "luna_multiep_gen2"):
+                sdc_constraints += [
+                    "",
+                    # The MAC's operating-rate select register (the
+                    # Gen1/Gen2 dialect mux, physical/layer.py `rate_r`,
+                    # netlist-aliased `operating_gen2`) fans out through
+                    # the whole physical+link netlist.  It toggles only
+                    # on an LTSSM rate change, which is always followed
+                    # by link retraining (milliseconds of quiesce)
+                    # before any data flows -- a true multicycle signal;
+                    # the same argument covers the vendor controller's
+                    # `speed` register in the usb31_enum branch below.
+                    "set_multicycle_path -setup 2 -from [get_regs "
+                    "{usb/physical/operating_gen2*}]",
+                    "set_multicycle_path -hold 1 -from [get_regs "
+                    "{usb/physical/operating_gen2*}]",
+                ]
         elif name == "usb31_enum":
             sdc_constraints = [
                 "create_clock -name pclk -period 6.4 "
