@@ -390,6 +390,35 @@ class DKUSBGW5AT60Platform(GowinPlatform):
                     "set_multicycle_path -hold 1 -from [get_regs "
                     "{usb/physical/operating_gen2*}]",
                 ]
+        elif name in ("luna_enum_gen1x2", "luna_multiep_gen1x2"):
+            # Gen 1x2-highest (width program) tops: the MAC rides the
+            # pre-MAC boot rate switch, so pclk/rxclk run 125 MHz for
+            # the whole MAC lifetime -- the 8.0 ns Gen1 goal, NOT the
+            # 6.4 ns Gen2 gate (usb3_design.md 7: Gen 1x2 cells close
+            # at Gen1 effort; over-constraining to 6.4 would re-enter
+            # the placement lottery for nothing).
+            sdc_constraints = [
+                "create_clock -name pclk -period 8.0 "
+                "[get_nets {serdes_pcs_tx_clk_i}]",
+                "create_clock -name rxclk -period 8.0 "
+                "[get_nets {serdes_pcs_rx_clk_i}]",
+                "create_clock -name upar_clk -period 10.0 "
+                "[get_nets {serdes_upar_clk_i}]",
+                "",
+                "set_false_path -from [get_clocks {pclk}] "
+                "-to [get_clocks {rxclk upar_clk sys_clk_0__p "
+                "clk_24m_0__io}]",
+                "set_false_path -from [get_clocks {rxclk}] "
+                "-to [get_clocks {pclk upar_clk sys_clk_0__p "
+                "clk_24m_0__io}]",
+                "set_false_path -from [get_clocks {upar_clk}] "
+                "-to [get_clocks {pclk rxclk sys_clk_0__p "
+                "clk_24m_0__io}]",
+                "set_false_path -from [get_clocks {sys_clk_0__p}] "
+                "-to [get_clocks {pclk rxclk upar_clk clk_24m_0__io}]",
+                "set_false_path -from [get_clocks {clk_24m_0__io}] "
+                "-to [get_clocks {pclk rxclk upar_clk sys_clk_0__p}]",
+            ]
         elif name == "usb31_enum":
             sdc_constraints = [
                 "create_clock -name pclk -period 6.4 "
