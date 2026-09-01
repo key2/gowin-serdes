@@ -423,6 +423,39 @@ Or just the TOML for inspection:
 serdes.generate_toml("serdes.toml")
 ```
 
+### TOML converter pitfalls (hard-won facts)
+
+The `serdes_toml_to_csr_*.bin` converter is **case-sensitive and silently
+ignores unknown values** — a wrong string produces a plausible-looking but
+different (or unchanged) CSR blob:
+
+- `encode_mode`/`decode_mode` must be lowercase **`"8b10b"`** (uppercase
+  `"8B10B"` programs a *different* PCS mode register value, 0x1FB instead of
+  0x173 — the lane appears configured but never word-aligns).
+- `loopBack` valid values: `"OFF"`, `"LB_NES"` (near-end serial), `"LB_FES"`
+  (far-end serial), `"LB_ENC"`, `"RX_ONLY"`, `"TX_ONLY"` (extracted from
+  `libSERDES_IP.so` / the converter binary). Anything else — including
+  `"PCS"`/`"NEAREND"` — is ignored without a warning.
+- When only Q1 lanes use Q1's own REFPAD, `ref_prop_dir` must stay `1` (no
+  cross-quad propagation); `2` is only for routing a Q1 pad clock towards
+  Q0 lanes. Getting this wrong changes the refclk mux registers
+  (`0x*08760`).
+
+The reliable verification method: generate a reference TOML with the Gowin
+IDE GUI for the same configuration, convert both, and `diff` the CSR blobs —
+the 1000BASE-X configuration in lambdaeth's
+`examples/tang_mega_138k_1000basex.py` is byte-identical to the IDE
+1GSERETH reference this way.
+
+### Lane control word (`fabric_ctrl`)
+
+`LaneConfig.fabric_ctrl` drives a constant on `FABRIC_LN#_CTRL_I` /
+`CTRL_I_H` (43 bits, default 0 = historical GND tie-off). The Gowin
+1GSERETH reference design drives `0x1` (bit 0) together with the
+`cpll_reset_by_fabric = true` / `cmu*_reset_by_fabric = true` /
+`por_toggle_by_fabric = true` TOML settings — use both halves of that scheme
+together (see the lambdaeth 1000BASE-X PHY for a working example).
+
 ---
 
 ## Usage
