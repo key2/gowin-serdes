@@ -134,6 +134,11 @@ class LaneConfig:
     # to reproduce the Gowin USB3.1 reference design settings).
     toml_lane_overrides: dict = field(default_factory=dict)
 
+    # Static value driven on FABRIC_LN#_CTRL_I / CTRL_I_H (43 bits). The
+    # Gowin 1GSERETH reference design drives 0x1 (bit 0) together with
+    # cpll/cmu_reset_by_fabric = true; 0 keeps the historical GND tie-off.
+    fabric_ctrl: int = 0
+
     @property
     def ffe_manual(self) -> bool:
         """True when any FFE coefficient is explicitly set."""

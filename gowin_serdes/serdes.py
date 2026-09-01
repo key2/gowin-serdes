@@ -295,6 +295,8 @@ class GowinSerDes(Component):
             f"FABRIC_LN{li}_TXDATA_I": lane._quad_txdata,
             f"FABRIC_LN{li}_TX_VLD_IN": lane._quad_tx_vld,
             f"FABRIC_LN{li}_TX_DISPARITY_I": lane._quad_tx_disparity,
+            f"FABRIC_LN{li}_CTRL_I": lane._quad_ctrl,
+            f"FABRIC_LN{li}_CTRL_I_H": lane._quad_ctrl,
             f"FABRIC_LN{li}_RXDATA_O": lane._quad_rxdata,
             f"FABRIC_LN{li}_RX_VLD_OUT": lane._quad_rx_vld,
             f"FABRIC_LN{li}_ASTAT_O": lane._quad_astat,

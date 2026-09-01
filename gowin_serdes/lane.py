@@ -77,6 +77,11 @@ class GowinSerDesLane(Component):
         self._quad_chbond_start = Signal(name="quad_chbond_start")
         self._quad_c2i_clk = Signal(name="quad_c2i_clk")
         self._quad_tx_disparity = Signal(8, name="quad_tx_disparity")
+        # Static lane control word (FABRIC_LN#_CTRL_I / CTRL_I_H). The Gowin
+        # 1GSERETH reference design drives the constant {34'b0,1'b0,4'b0000,
+        # 4'b0001} here (bit 0 set) together with cpll/cmu_reset_by_fabric
+        # TOML settings; default 0 keeps the historical GND tie-off.
+        self._quad_ctrl = Signal(43, name="quad_ctrl")
 
         # QUADB-only 64B66B signals (outputs from QUAD)
         self._quad_64b66b_tx_invld_blk = Signal(name="quad_64b66b_tx_invld_blk")
@@ -106,6 +111,9 @@ class GowinSerDesLane(Component):
     def elaborate(self, platform):
         m = Module()
         cfg = self.config
+
+        # Static lane control word.
+        m.d.comb += self._quad_ctrl.eq(getattr(cfg, "fabric_ctrl", 0))
 
         # ── TX wiring ──────────────────────────────────────────
         if cfg.has_tx:
