@@ -279,7 +279,10 @@ def _default_lane_config(
 
 _ENCODING_MAP = {
     EncodingMode.OFF: "OFF",
-    EncodingMode.B8B10B: "8B10B",
+    # NOTE: the Gowin serdes_toml_to_csr converter is case-sensitive; the
+    # IDE emits lowercase "8b10b" and uppercase "8B10B" produces a
+    # *different* PCS mode register value (0x1FB instead of 0x173).
+    EncodingMode.B8B10B: "8b10b",
     EncodingMode.B64B66B: "64B66B",
     EncodingMode.B64B67B: "64B67B",
 }
@@ -502,9 +505,16 @@ def _compute_refclk_routing(
                 if 1 in active_quads:
                     routing[1]["refimux0_sel"] = 0
                 if 0 in active_quads:
+                    # Cross-quad: propagate the Q1 pad clock towards Q0.
                     routing[0]["refimux0_sel"] = 2
-                for qi in range(num_quads):
-                    routing[qi]["ref_prop_dir"] = 2
+                    for qi in range(num_quads):
+                        routing[qi]["ref_prop_dir"] = 2
+                else:
+                    # Q1 lanes fed from Q1's own REFPAD0: no propagation
+                    # (matches the Gowin IDE output for the 1GSERETH
+                    # example on the Tang Mega 138K Pro, Q1 lanes 0/1).
+                    for qi in range(num_quads):
+                        routing[qi]["ref_prop_dir"] = 1
 
         elif ref_src == RefClkSource.Q1_REFCLK1:
             routing[1]["ref_pad1_freq"] = ref_freq
