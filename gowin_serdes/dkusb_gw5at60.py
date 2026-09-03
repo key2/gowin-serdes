@@ -351,10 +351,22 @@ class DKUSBGW5AT60Platform(GowinPlatform):
         # and mask the design's own cones.
         if name in ("luna_enum", "luna_acm", "luna_loopback", "luna_multiep",
                     "luna_enum_gen2", "luna_multiep_gen2"):
+            # rxclk is the RECOVERED clock: at the 10G trim it runs at
+            # 10.3125 GHz / 64 = 161.133 MHz -- NOT the 156.25 MHz of
+            # the local pclk.  The Gen2 tops therefore constrain rxclk
+            # at 6.2 ns (161.29 MHz); the shared 6.4 ns figure was 3%
+            # optimistic and one Gen2 build that "met" 159.6 MHz showed
+            # intermittent on-wire corruption (EPROTO -71 during
+            # enumeration) from under-constrained rx-domain paths.  The
+            # Gen1 tops keep 6.4 ns: their recovered clock is 125 MHz,
+            # and over-constraining re-enters the placement lottery for
+            # nothing.
+            rx_period = "6.2" if name in ("luna_enum_gen2",
+                                          "luna_multiep_gen2") else "6.4"
             sdc_constraints = [
                 "create_clock -name pclk -period 6.4 "
                 "[get_nets {serdes_pcs_tx_clk_i}]",
-                "create_clock -name rxclk -period 6.4 "
+                f"create_clock -name rxclk -period {rx_period} "
                 "[get_nets {serdes_pcs_rx_clk_i}]",
                 "create_clock -name upar_clk -period 10.0 "
                 "[get_nets {serdes_upar_clk_i}]",
