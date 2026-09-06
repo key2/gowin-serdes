@@ -751,13 +751,20 @@ class ClockFreqProbe(Elaboratable):
 
     def __init__(self, clk_freq, baud=115_200, gate_bits=23,
                  channels=(("pclk", None), ("rxprobe", None),
-                           ("upar", None))):
+                           ("upar", None)), compact=False):
         """`channels`: (domain, event) pairs.  event=None counts clock
         cycles (frequency); an event Signal counts its assertions in that
-        domain (event rate)."""
+        domain (event rate).
+
+        `compact=True` shares a cfg-domain hex converter and holds each
+        delta from its leading-space TX handshake through its seven digits.
+        The default retains the legacy formatter. Allow snapshots to settle
+        before that handshake and a whole serial line between gates.
+        """
         self._divisor = clk_freq // baud
         self._gate_bits = gate_bits
         self._channels = list(channels)
+        self._compact = compact
         self.flags = Signal(4)          # cfg domain; appended as hex digit
         self.tx_o = Signal(init=1)
 
@@ -831,29 +838,62 @@ class ClockFreqProbe(Elaboratable):
         active = Signal()
 
         char = Signal(8)
-        with m.Switch(idx):
-            with m.Case(0):
-                m.d.comb += char.eq(ord("C"))
-            for gi, delta in enumerate(deltas):
-                base = 1 + gi * per
-                with m.Case(base):
+        if self._compact:
+            # Compact formatter additions: Copyright (c) 2026 key2.
+            # SPDX-License-Identifier: BSD-3-Clause
+            group_pos = Signal.like(idx)
+            group_index = group_pos[3:]
+            offset = group_pos[:3]
+            selected_delta = Signal(self.WIDTH)
+            nib = Signal(4)
+            m.d.comb += [
+                group_pos.eq(idx - 1),
+                # Seven digits, MS nibble first; offset zero is the space.
+                nib.eq(selected_delta.word_select(~offset, 4)),
+                char.eq(Mux(nib < 10, ord("0") + nib,
+                            ord("a") - 10 + nib)),
+            ]
+            if n:
+                with m.If((idx != 0) & (idx < 1 + n * per) & (offset == 0)):
                     m.d.comb += char.eq(ord(" "))
-                for j in range(DIGITS):
-                    nib = delta[(DIGITS - 1 - j) * 4:(DIGITS - j) * 4]
-                    with m.Case(base + 1 + j):
-                        m.d.comb += char.eq(
-                            Mux(nib < 10, ord("0") + nib,
-                                ord("a") - 10 + nib))
-            with m.Case(1 + n * per):
-                m.d.comb += char.eq(ord(" "))
-            with m.Case(1 + n * per + 1):
-                m.d.comb += char.eq(
-                    Mux(flags_l < 10, ord("0") + flags_l,
-                        ord("a") - 10 + flags_l))
-            with m.Case(total - 2):
-                m.d.comb += char.eq(ord("\r"))
-            with m.Case(total - 1):
-                m.d.comb += char.eq(ord("\n"))
+                    # The space gives this register one byte to settle.
+                    with m.If(active & tx.rdy):
+                        m.d.cfg += selected_delta.eq(Array(deltas)[group_index])
+            with m.Switch(idx):
+                with m.Case(0):
+                    m.d.comb += char.eq(ord("C"))
+                with m.Case(1 + n * per):
+                    m.d.comb += char.eq(ord(" "))
+                with m.Case(1 + n * per + 1):
+                    m.d.comb += nib.eq(flags_l)
+                with m.Case(total - 2):
+                    m.d.comb += char.eq(ord("\r"))
+                with m.Case(total - 1):
+                    m.d.comb += char.eq(ord("\n"))
+        else:
+            with m.Switch(idx):
+                with m.Case(0):
+                    m.d.comb += char.eq(ord("C"))
+                for gi, delta in enumerate(deltas):
+                    base = 1 + gi * per
+                    with m.Case(base):
+                        m.d.comb += char.eq(ord(" "))
+                    for j in range(DIGITS):
+                        nib = delta[(DIGITS - 1 - j) * 4:(DIGITS - j) * 4]
+                        with m.Case(base + 1 + j):
+                            m.d.comb += char.eq(
+                                Mux(nib < 10, ord("0") + nib,
+                                    ord("a") - 10 + nib))
+                with m.Case(1 + n * per):
+                    m.d.comb += char.eq(ord(" "))
+                with m.Case(1 + n * per + 1):
+                    m.d.comb += char.eq(
+                        Mux(flags_l < 10, ord("0") + flags_l,
+                            ord("a") - 10 + flags_l))
+                with m.Case(total - 2):
+                    m.d.comb += char.eq(ord("\r"))
+                with m.Case(total - 1):
+                    m.d.comb += char.eq(ord("\n"))
 
         with m.If(active):
             m.d.comb += [tx.data.eq(char), tx.ack.eq(1)]
