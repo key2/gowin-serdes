@@ -388,6 +388,36 @@ class DKUSBGW5AT60Platform(GowinPlatform):
             if name in ("luna_enum_gen2", "luna_multiep_gen2"):
                 sdc_constraints += [
                     "",
+                    # Width program (usb3_design.md 13.3): the Gen2-128
+                    # MAC clock is pclk/2 by a fabric FF divider
+                    # (source signal ``core_div`` in the top's
+                    # reset-free ss_raw domain), edge-locked to pclk --
+                    # a GENERATED clock, so every core<->pclk seam path
+                    # is analyzed as the synchronous 2:1 path it is
+                    # (6.4 ns worst launch/capture pair; the 2:1 PIPE
+                    # bridge keeps those cones register-thin).  NET
+                    # NAME: GowinSynthesis canonicalizes the alias
+                    # group (core_div = ClockSignal(core_raw/core/sync))
+                    # to the domain clock net ``core_raw_clk`` (the
+                    # divider FF synthesizes as instance
+                    # ``core_raw_clk_s0``).  Do NOT false-path core_clk
+                    # against pclk; against everything else it is as
+                    # asynchronous as pclk itself.
+                    "create_generated_clock -name core_clk "
+                    "-source [get_nets {serdes_pcs_tx_clk_i}] "
+                    "-divide_by 2 [get_nets {core_raw_clk}]",
+                    "set_false_path -from [get_clocks {core_clk}] "
+                    "-to [get_clocks {rxclk upar_clk sys_clk_0__p "
+                    "clk_24m_0__io}]",
+                    "set_false_path -from [get_clocks {rxclk}] "
+                    "-to [get_clocks {core_clk}]",
+                    "set_false_path -from [get_clocks {upar_clk}] "
+                    "-to [get_clocks {core_clk}]",
+                    "set_false_path -from [get_clocks {sys_clk_0__p}] "
+                    "-to [get_clocks {core_clk}]",
+                    "set_false_path -from [get_clocks {clk_24m_0__io}] "
+                    "-to [get_clocks {core_clk}]",
+                    "",
                     # The MAC's operating-rate select register (the
                     # Gen1/Gen2 dialect mux, physical/layer.py `rate_r`,
                     # netlist-aliased `operating_gen2`) fans out through
